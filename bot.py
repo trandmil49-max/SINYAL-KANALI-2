@@ -1,0 +1,1027 @@
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import sqlite3
+import statistics
+import time
+import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Iterable
+from zoneinfo import ZoneInfo
+
+
+BINANCE_BASE_URL = "https://fapi.binance.com"
+TELEGRAM_BASE_URL = "https://api.telegram.org"
+DB_PATH = "signals.db"
+LOCAL_TZ = ZoneInfo("Europe/Istanbul")
+
+
+@dataclass(frozen=True)
+class Config:
+    telegram_bot_token: str
+    telegram_chat_id: str
+    scan_interval_seconds: int = 300
+    max_symbols_to_analyze: int = 80
+    min_quote_volume_usdt: float = 50_000_000
+    min_confidence: float = 82
+    signal_cooldown_minutes: int = 240
+    max_signals_per_symbol_per_day: int = 2
+    position_check_interval_seconds: int = 30
+    announce_empty_scans: bool = False
+    binance_timeout_seconds: int = 12
+    log_level: str = "INFO"
+
+    @staticmethod
+    def load() -> "Config":
+        load_dotenv(".env")
+        return Config(
+            telegram_bot_token=get_required_env("TELEGRAM_BOT_TOKEN"),
+            telegram_chat_id=get_required_env("TELEGRAM_CHAT_ID"),
+            scan_interval_seconds=get_int_env("SCAN_INTERVAL_SECONDS", 300),
+            max_symbols_to_analyze=get_int_env("MAX_SYMBOLS_TO_ANALYZE", 80),
+            min_quote_volume_usdt=get_float_env("MIN_QUOTE_VOLUME_USDT", 50_000_000),
+            min_confidence=get_float_env("MIN_CONFIDENCE", 82),
+            signal_cooldown_minutes=get_int_env("SIGNAL_COOLDOWN_MINUTES", 240),
+            max_signals_per_symbol_per_day=get_int_env("MAX_SIGNALS_PER_SYMBOL_PER_DAY", 2),
+            position_check_interval_seconds=get_int_env("POSITION_CHECK_INTERVAL_SECONDS", 30),
+            announce_empty_scans=get_bool_env("ANNOUNCE_EMPTY_SCANS", False),
+            binance_timeout_seconds=get_int_env("BINANCE_TIMEOUT_SECONDS", 12),
+            log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        )
+
+
+@dataclass
+class Candle:
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    close_time: int
+    quote_volume: float
+
+
+@dataclass
+class MarketSymbol:
+    symbol: str
+    quote_volume: float
+    price_change_percent: float
+    last_price: float
+
+
+@dataclass
+class BtcHealth:
+    status: str
+    direction: str
+    score: float
+    volatility: float
+    details: list[str]
+
+
+@dataclass
+class Signal:
+    symbol: str
+    side: str
+    confidence: float
+    entry: float
+    stop_loss: float
+    tp1: float
+    tp2: float
+    leverage: int
+    risk_reward: float
+    btc_status: str
+    reasons: list[str]
+
+
+class HttpClient:
+    def __init__(self, timeout_seconds: int) -> None:
+        self.timeout_seconds = timeout_seconds
+
+    def get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        request = urllib.request.Request(url, headers={"User-Agent": "professional-signal-bot/1.0"})
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+
+class TelegramClient:
+    def __init__(self, token: str, chat_id: str, timeout_seconds: int) -> None:
+        self.token = token
+        self.chat_id = chat_id
+        self.http = HttpClient(timeout_seconds)
+        self.offset = 0
+
+    def send_message(self, text: str) -> None:
+        url = f"{TELEGRAM_BASE_URL}/bot{self.token}/sendMessage"
+        data = urllib.parse.urlencode(
+            {
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": "true",
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(url, data=data, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                response.read()
+        except Exception:
+            logging.exception("Telegram message failed")
+
+    def get_updates(self) -> list[dict[str, Any]]:
+        url = f"{TELEGRAM_BASE_URL}/bot{self.token}/getUpdates"
+        params = {"timeout": 1, "offset": self.offset}
+        try:
+            updates = self.http.get_json(url, params)
+        except Exception:
+            logging.exception("Telegram update polling failed")
+            return []
+        if not updates.get("ok"):
+            return []
+        result = updates.get("result", [])
+        if result:
+            self.offset = max(update["update_id"] for update in result) + 1
+        return result
+
+
+class BinanceFuturesClient:
+    def __init__(self, timeout_seconds: int) -> None:
+        self.http = HttpClient(timeout_seconds)
+
+    def exchange_symbols(self) -> set[str]:
+        data = self.http.get_json(f"{BINANCE_BASE_URL}/fapi/v1/exchangeInfo")
+        symbols = set()
+        for item in data.get("symbols", []):
+            if (
+                item.get("contractType") == "PERPETUAL"
+                and item.get("quoteAsset") == "USDT"
+                and item.get("status") == "TRADING"
+            ):
+                symbols.add(item["symbol"])
+        return symbols
+
+    def tickers_24h(self) -> list[MarketSymbol]:
+        live_symbols = self.exchange_symbols()
+        data = self.http.get_json(f"{BINANCE_BASE_URL}/fapi/v1/ticker/24hr")
+        symbols = []
+        for item in data:
+            symbol = item.get("symbol", "")
+            if symbol not in live_symbols:
+                continue
+            try:
+                symbols.append(
+                    MarketSymbol(
+                        symbol=symbol,
+                        quote_volume=float(item["quoteVolume"]),
+                        price_change_percent=float(item["priceChangePercent"]),
+                        last_price=float(item["lastPrice"]),
+                    )
+                )
+            except (KeyError, ValueError):
+                continue
+        return symbols
+
+    def klines(self, symbol: str, interval: str, limit: int = 210) -> list[Candle]:
+        data = self.http.get_json(
+            f"{BINANCE_BASE_URL}/fapi/v1/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit},
+        )
+        candles = []
+        for row in data:
+            candles.append(
+                Candle(
+                    open_time=int(row[0]),
+                    open=float(row[1]),
+                    high=float(row[2]),
+                    low=float(row[3]),
+                    close=float(row[4]),
+                    volume=float(row[5]),
+                    close_time=int(row[6]),
+                    quote_volume=float(row[7]),
+                )
+            )
+        return candles
+
+    def all_mark_prices(self) -> dict[str, float]:
+        """Single lightweight call that returns the latest price for every symbol."""
+        data = self.http.get_json(f"{BINANCE_BASE_URL}/fapi/v1/ticker/price")
+        prices: dict[str, float] = {}
+        for item in data:
+            try:
+                prices[item["symbol"]] = float(item["price"])
+            except (KeyError, ValueError, TypeError):
+                continue
+        return prices
+
+    def funding_rate(self, symbol: str) -> float | None:
+        try:
+            data = self.http.get_json(f"{BINANCE_BASE_URL}/fapi/v1/premiumIndex", {"symbol": symbol})
+            return float(data["lastFundingRate"])
+        except Exception:
+            logging.info("Funding unavailable for %s", symbol)
+            return None
+
+    def open_interest(self, symbol: str) -> float | None:
+        try:
+            data = self.http.get_json(f"{BINANCE_BASE_URL}/fapi/v1/openInterest", {"symbol": symbol})
+            return float(data["openInterest"])
+        except Exception:
+            logging.info("Open interest unavailable for %s", symbol)
+            return None
+
+
+class SignalDatabase:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._init()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    entry REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    tp1 REAL NOT NULL,
+                    tp2 REAL NOT NULL,
+                    created_at INTEGER NOT NULL
+                )
+                """
+            )
+            # Migration: add columns needed for TP/SL tracking to existing databases.
+            existing_columns = {row["name"] for row in conn.execute("PRAGMA table_info(signals)")}
+            migrations = {
+                "leverage": "INTEGER NOT NULL DEFAULT 1",
+                "status": "TEXT NOT NULL DEFAULT 'OPEN'",
+                "tp1_hit": "INTEGER NOT NULL DEFAULT 0",
+                "tp2_hit": "INTEGER NOT NULL DEFAULT 0",
+                "sl_hit": "INTEGER NOT NULL DEFAULT 0",
+                "closed_at": "INTEGER",
+            }
+            for column, declaration in migrations.items():
+                if column not in existing_columns:
+                    conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {declaration}")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_side_time ON signals(symbol, side, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+
+    def recently_sent(self, symbol: str, side: str, cooldown_minutes: int) -> bool:
+        cutoff = int(time.time()) - cooldown_minutes * 60
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM signals WHERE symbol = ? AND side = ? AND created_at >= ? LIMIT 1",
+                (symbol, side, cutoff),
+            ).fetchone()
+        return row is not None
+
+    def signals_today_count(self, symbol: str) -> int:
+        """Rolling 24h count of signals sent for a symbol, regardless of side."""
+        cutoff = int(time.time()) - 24 * 60 * 60
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM signals WHERE symbol = ? AND created_at >= ?",
+                (symbol, cutoff),
+            ).fetchone()
+        return int(row["n"])
+
+    def save_signal(self, signal: Signal) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO signals(symbol, side, confidence, entry, stop_loss, tp1, tp2, leverage, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    signal.symbol,
+                    signal.side,
+                    signal.confidence,
+                    signal.entry,
+                    signal.stop_loss,
+                    signal.tp1,
+                    signal.tp2,
+                    signal.leverage,
+                    int(time.time()),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def total_signals(self) -> int:
+        with self._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS n FROM signals").fetchone()
+        return int(row["n"])
+
+    def open_positions(self) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute("SELECT * FROM signals WHERE status = 'OPEN'").fetchall()
+
+    def mark_tp1_hit(self, signal_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE signals SET tp1_hit = 1 WHERE id = ?", (signal_id,))
+
+    def mark_tp2_hit(self, signal_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE signals SET tp2_hit = 1, status = 'TP2', closed_at = ? WHERE id = ?",
+                (int(time.time()), signal_id),
+            )
+
+    def mark_sl_hit(self, signal_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE signals SET sl_hit = 1, status = 'SL', closed_at = ? WHERE id = ?",
+                (int(time.time()), signal_id),
+            )
+
+    def performance_summary(self) -> tuple[int, int, int]:
+        """Returns (tp2_closed, sl_closed, still_open) counts for basic win-rate tracking."""
+        with self._connect() as conn:
+            tp2 = conn.execute("SELECT COUNT(*) AS n FROM signals WHERE status = 'TP2'").fetchone()["n"]
+            sl = conn.execute("SELECT COUNT(*) AS n FROM signals WHERE status = 'SL'").fetchone()["n"]
+            open_count = conn.execute("SELECT COUNT(*) AS n FROM signals WHERE status = 'OPEN'").fetchone()["n"]
+        return int(tp2), int(sl), int(open_count)
+
+
+class IndicatorEngine:
+    @staticmethod
+    def ema(values: list[float], period: int) -> list[float]:
+        if not values:
+            return []
+        alpha = 2 / (period + 1)
+        result = [values[0]]
+        for value in values[1:]:
+            result.append(value * alpha + result[-1] * (1 - alpha))
+        return result
+
+    @staticmethod
+    def rsi(values: list[float], period: int = 14) -> float:
+        if len(values) <= period:
+            return 50.0
+        gains = []
+        losses = []
+        for current, previous in zip(values[-period:], values[-period - 1 : -1]):
+            change = current - previous
+            gains.append(max(change, 0))
+            losses.append(abs(min(change, 0)))
+        avg_gain = statistics.fmean(gains) if gains else 0
+        avg_loss = statistics.fmean(losses) if losses else 0
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def macd(values: list[float]) -> tuple[float, float, float]:
+        if len(values) < 35:
+            return 0.0, 0.0, 0.0
+        ema12 = IndicatorEngine.ema(values, 12)
+        ema26 = IndicatorEngine.ema(values, 26)
+        macd_line = [a - b for a, b in zip(ema12[-len(ema26) :], ema26)]
+        signal_line = IndicatorEngine.ema(macd_line, 9)
+        histogram = macd_line[-1] - signal_line[-1]
+        return macd_line[-1], signal_line[-1], histogram
+
+    @staticmethod
+    def atr(candles: list[Candle], period: int = 14) -> float:
+        if len(candles) <= period:
+            return 0.0
+        true_ranges = []
+        for candle, previous in zip(candles[-period:], candles[-period - 1 : -1]):
+            true_ranges.append(
+                max(
+                    candle.high - candle.low,
+                    abs(candle.high - previous.close),
+                    abs(candle.low - previous.close),
+                )
+            )
+        return statistics.fmean(true_ranges)
+
+    @staticmethod
+    def adx(candles: list[Candle], period: int = 14) -> float:
+        if len(candles) <= period + 1:
+            return 0.0
+        plus_dm = []
+        minus_dm = []
+        true_ranges = []
+        recent = candles[-period - 1 :]
+        for current, previous in zip(recent[1:], recent[:-1]):
+            up_move = current.high - previous.high
+            down_move = previous.low - current.low
+            plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0)
+            minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0)
+            true_ranges.append(max(current.high - current.low, abs(current.high - previous.close), abs(current.low - previous.close)))
+        atr_value = sum(true_ranges) or 1
+        plus_di = 100 * sum(plus_dm) / atr_value
+        minus_di = 100 * sum(minus_dm) / atr_value
+        if plus_di + minus_di == 0:
+            return 0.0
+        return 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+
+
+class ProfessionalSignalEngine:
+    def __init__(self, binance: BinanceFuturesClient, config: Config) -> None:
+        self.binance = binance
+        self.config = config
+        self.last_scan_summary = "Henüz tarama yapılmadı."
+
+    def scan(self) -> list[Signal]:
+        started = time.time()
+        candidates = self._fast_filter_symbols()
+        btc_health = self._analyze_btc()
+        signals = []
+        rejected = 0
+
+        for market_symbol in candidates:
+            if market_symbol.symbol == "BTCUSDT":
+                continue
+            try:
+                signal = self._analyze_symbol(market_symbol.symbol, btc_health)
+            except Exception:
+                rejected += 1
+                logging.exception("Symbol analysis failed: %s", market_symbol.symbol)
+                continue
+            if signal:
+                signals.append(signal)
+            else:
+                rejected += 1
+
+        signals.sort(key=lambda item: item.confidence, reverse=True)
+        elapsed = round(time.time() - started, 1)
+        self.last_scan_summary = (
+            f"Son tarama: {local_now_text()}\n"
+            f"BTC: {btc_health.status} ({btc_health.direction}, skor {btc_health.score:.0f})\n"
+            f"Analiz edilen: {len(candidates)}\n"
+            f"Reddedilen: {rejected}\n"
+            f"Sinyal adayı: {len(signals)}\n"
+            f"Süre: {elapsed} sn"
+        )
+        return signals
+
+    def _fast_filter_symbols(self) -> list[MarketSymbol]:
+        tickers = self.binance.tickers_24h()
+        filtered = [
+            item
+            for item in tickers
+            if item.quote_volume >= self.config.min_quote_volume_usdt
+            and item.last_price > 0
+            and not item.symbol.endswith("USDC")
+        ]
+        filtered.sort(key=lambda item: item.quote_volume, reverse=True)
+        return filtered[: self.config.max_symbols_to_analyze]
+
+    def _analyze_btc(self) -> BtcHealth:
+        candles_1h = self.binance.klines("BTCUSDT", "1h", 210)
+        closes = [c.close for c in candles_1h]
+        ema50 = IndicatorEngine.ema(closes, 50)[-1]
+        ema200 = IndicatorEngine.ema(closes, 200)[-1]
+        rsi = IndicatorEngine.rsi(closes)
+        atr = IndicatorEngine.atr(candles_1h)
+        adx = IndicatorEngine.adx(candles_1h)
+        price = closes[-1]
+        volatility = atr / price if price else 0
+        score = 50
+        details = []
+
+        if price > ema50 > ema200:
+            score += 22
+            direction = "Bullish"
+            details.append("BTC EMA yapısı pozitif")
+        elif price < ema50 < ema200:
+            score += 22
+            direction = "Bearish"
+            details.append("BTC EMA yapısı negatif")
+        else:
+            direction = "Mixed"
+            details.append("BTC trendi karışık")
+
+        if 45 <= rsi <= 68:
+            score += 10
+            details.append("BTC momentumu sağlıklı")
+        elif rsi > 76 or rsi < 24:
+            score -= 12
+            details.append("BTC aşırı bölgede")
+
+        if 15 <= adx <= 45:
+            score += 8
+            details.append("BTC trend gücü kabul edilebilir")
+        if volatility > 0.035:
+            score -= 18
+            details.append("BTC volatilitesi yüksek")
+
+        score = clamp(score, 0, 100)
+        if score >= 72:
+            status = "Healthy"
+        elif score >= 55:
+            status = "Cautious"
+        else:
+            status = "Dangerous"
+        return BtcHealth(status=status, direction=direction, score=score, volatility=volatility, details=details)
+
+    def _analyze_symbol(self, symbol: str, btc: BtcHealth) -> Signal | None:
+        candles_15m = self.binance.klines(symbol, "15m", 210)
+        candles_1h = self.binance.klines(symbol, "1h", 210)
+        if len(candles_15m) < 100 or len(candles_1h) < 100:
+            return None
+
+        closes_15m = [c.close for c in candles_15m]
+        closes_1h = [c.close for c in candles_1h]
+        price = closes_15m[-1]
+        atr = IndicatorEngine.atr(candles_15m)
+        if atr <= 0 or price <= 0:
+            return None
+
+        ema20 = IndicatorEngine.ema(closes_15m, 20)
+        ema50 = IndicatorEngine.ema(closes_15m, 50)
+        ema200_1h = IndicatorEngine.ema(closes_1h, 200)
+        rsi = IndicatorEngine.rsi(closes_15m)
+        macd_line, macd_signal, macd_hist = IndicatorEngine.macd(closes_15m)
+        adx = IndicatorEngine.adx(candles_15m)
+        rel_volume = self._relative_volume(candles_15m)
+        funding = self.binance.funding_rate(symbol)
+        open_interest = self.binance.open_interest(symbol)
+        structure = self._market_structure(candles_15m)
+        volatility = atr / price
+
+        long_score, long_reasons = self._score_direction(
+            "LONG",
+            price,
+            ema20[-1],
+            ema50[-1],
+            ema200_1h[-1],
+            rsi,
+            macd_line,
+            macd_signal,
+            macd_hist,
+            adx,
+            rel_volume,
+            funding,
+            open_interest,
+            structure,
+            volatility,
+            btc,
+        )
+        short_score, short_reasons = self._score_direction(
+            "SHORT",
+            price,
+            ema20[-1],
+            ema50[-1],
+            ema200_1h[-1],
+            rsi,
+            macd_line,
+            macd_signal,
+            macd_hist,
+            adx,
+            rel_volume,
+            funding,
+            open_interest,
+            structure,
+            volatility,
+            btc,
+        )
+
+        if max(long_score, short_score) < self.config.min_confidence:
+            return None
+        if long_score >= short_score:
+            return self._build_signal(symbol, "LONG", long_score, price, atr, long_reasons)
+        return self._build_signal(symbol, "SHORT", short_score, price, atr, short_reasons)
+
+    def _score_direction(
+        self,
+        side: str,
+        price: float,
+        ema20: float,
+        ema50: float,
+        ema200_1h: float,
+        rsi: float,
+        macd_line: float,
+        macd_signal: float,
+        macd_hist: float,
+        adx: float,
+        rel_volume: float,
+        funding: float | None,
+        open_interest: float | None,
+        structure: str,
+        volatility: float,
+        btc: BtcHealth,
+    ) -> tuple[float, list[str]]:
+        score = 0.0
+        reasons = []
+        bullish = side == "LONG"
+
+        trend_ok = price > ema20 > ema50 and price > ema200_1h if bullish else price < ema20 < ema50 and price < ema200_1h
+        if trend_ok:
+            score += 22
+            reasons.append("Trend confirmed")
+
+        btc_ok = btc.status != "Dangerous" and (btc.direction in ("Mixed", "Bullish") if bullish else btc.direction in ("Mixed", "Bearish"))
+        if btc_ok:
+            score += 14
+            reasons.append(f"BTC status supportive: {btc.status}")
+        elif btc.status == "Dangerous":
+            score -= 18
+            reasons.append("BTC dangerous, trade filtered conservatively")
+
+        momentum_ok = (rsi > 52 and macd_line > macd_signal and macd_hist > 0) if bullish else (rsi < 48 and macd_line < macd_signal and macd_hist < 0)
+        if momentum_ok:
+            score += 18
+            reasons.append("Momentum confirmed")
+
+        structure_ok = structure == ("Bullish" if bullish else "Bearish")
+        if structure_ok:
+            score += 14
+            reasons.append("Market structure confirmed")
+
+        if rel_volume >= 1.15:
+            score += 12
+            reasons.append(f"Volume confirmed ({rel_volume:.2f}x)")
+        elif rel_volume < 0.75:
+            score -= 8
+            reasons.append("Weak participation")
+
+        if 16 <= adx <= 42:
+            score += 8
+            reasons.append("Trend strength acceptable")
+        elif adx < 12:
+            score -= 8
+            reasons.append("Trend strength weak")
+
+        if volatility <= 0.022:
+            score += 7
+            reasons.append("Volatility controlled")
+        elif volatility > 0.04:
+            score -= 12
+            reasons.append("Volatility too high")
+
+        if funding is not None:
+            if bullish and funding < 0.0008:
+                score += 3
+                reasons.append("Funding acceptable")
+            elif not bullish and funding > -0.0008:
+                score += 3
+                reasons.append("Funding acceptable")
+            else:
+                score -= 5
+                reasons.append("Funding crowded")
+
+        if open_interest is not None and open_interest > 0:
+            score += 2
+            reasons.append("Open interest available")
+
+        return clamp(score, 0, 100), reasons
+
+    def _build_signal(self, symbol: str, side: str, confidence: float, entry: float, atr: float, reasons: list[str]) -> Signal:
+        risk_distance = atr * 1.35
+        reward_1 = risk_distance * 1.45
+        reward_2 = risk_distance * 2.25
+        if side == "LONG":
+            stop_loss = entry - risk_distance
+            tp1 = entry + reward_1
+            tp2 = entry + reward_2
+        else:
+            stop_loss = entry + risk_distance
+            tp1 = entry - reward_1
+            tp2 = entry - reward_2
+        risk_reward = abs(tp2 - entry) / abs(entry - stop_loss)
+        leverage = self._suggest_leverage(atr / entry)
+        return Signal(
+            symbol=symbol,
+            side=side,
+            confidence=confidence,
+            entry=entry,
+            stop_loss=stop_loss,
+            tp1=tp1,
+            tp2=tp2,
+            leverage=leverage,
+            risk_reward=risk_reward,
+            btc_status=reasons[1].replace("BTC status supportive: ", "") if len(reasons) > 1 else "Checked",
+            reasons=reasons,
+        )
+
+    @staticmethod
+    def _relative_volume(candles: list[Candle]) -> float:
+        if len(candles) < 30:
+            return 0.0
+        current = candles[-1].quote_volume
+        baseline = statistics.fmean(c.quote_volume for c in candles[-21:-1])
+        return current / baseline if baseline else 0.0
+
+    @staticmethod
+    def _market_structure(candles: list[Candle]) -> str:
+        recent = candles[-24:]
+        highs = [c.high for c in recent]
+        lows = [c.low for c in recent]
+        first_high = max(highs[:12])
+        second_high = max(highs[12:])
+        first_low = min(lows[:12])
+        second_low = min(lows[12:])
+        if second_high > first_high and second_low > first_low:
+            return "Bullish"
+        if second_high < first_high and second_low < first_low:
+            return "Bearish"
+        return "Mixed"
+
+    @staticmethod
+    def _suggest_leverage(volatility: float) -> int:
+        if volatility <= 0.008:
+            return 10
+        if volatility <= 0.015:
+            return 7
+        if volatility <= 0.025:
+            return 5
+        return 3
+
+
+class SignalBot:
+    def __init__(self, config: Config) -> None:
+        self.config = config
+        self.telegram = TelegramClient(config.telegram_bot_token, config.telegram_chat_id, config.binance_timeout_seconds)
+        self.db = SignalDatabase(DB_PATH)
+        self.engine = ProfessionalSignalEngine(BinanceFuturesClient(config.binance_timeout_seconds), config)
+        self.next_scan_at = 0.0
+        self.next_position_check_at = 0.0
+
+    def run(self) -> None:
+        self.telegram.send_message("✅ Binance Futures signal bot aktif.\nKomutlar: /scan /status /help")
+        while True:
+            try:
+                self._handle_updates()
+                now = time.time()
+                if now >= self.next_scan_at:
+                    self._run_scan(send_empty_report=self.config.announce_empty_scans)
+                    self.next_scan_at = time.time() + self.config.scan_interval_seconds
+                if now >= self.next_position_check_at:
+                    self._check_open_positions()
+                    self.next_position_check_at = time.time() + self.config.position_check_interval_seconds
+                time.sleep(2)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                logging.exception("Main loop error")
+                self.telegram.send_message(f"⚠️ Bot hata yakaladı ve çalışmaya devam ediyor:\n{html_escape(str(exc))}")
+                time.sleep(10)
+
+    def _check_open_positions(self) -> None:
+        open_positions = self.db.open_positions()
+        if not open_positions:
+            return
+        try:
+            prices = self.engine.binance.all_mark_prices()
+        except Exception:
+            logging.exception("Position price fetch failed")
+            return
+        for row in open_positions:
+            price = prices.get(row["symbol"])
+            if price is None:
+                continue
+            self._evaluate_position(row, price)
+
+    def _evaluate_position(self, row: sqlite3.Row, price: float) -> None:
+        side = row["side"]
+        hit_sl = price <= row["stop_loss"] if side == "LONG" else price >= row["stop_loss"]
+        hit_tp2 = price >= row["tp2"] if side == "LONG" else price <= row["tp2"]
+        hit_tp1 = price >= row["tp1"] if side == "LONG" else price <= row["tp1"]
+
+        # Stop loss takes priority: protecting capital is checked before targets.
+        if hit_sl and not row["sl_hit"]:
+            self.telegram.send_message(format_sl_hit_message(row, price))
+            self.db.mark_sl_hit(row["id"])
+            return
+
+        if hit_tp2 and not row["tp2_hit"]:
+            self.telegram.send_message(format_tp_hit_message(row, price, level=2))
+            self.db.mark_tp2_hit(row["id"])
+            return
+
+        if hit_tp1 and not row["tp1_hit"]:
+            self.telegram.send_message(format_tp_hit_message(row, price, level=1))
+            self.db.mark_tp1_hit(row["id"])
+            # Position stays OPEN after TP1 so we keep watching for TP2 or SL.
+
+    def _handle_updates(self) -> None:
+        for update in self.telegram.get_updates():
+            message = update.get("message") or update.get("channel_post") or {}
+            text = (message.get("text") or "").strip().lower()
+            chat_id = str((message.get("chat") or {}).get("id", ""))
+            if chat_id and chat_id != self.config.telegram_chat_id:
+                continue
+            if text.startswith("/start") or text.startswith("/help"):
+                self.telegram.send_message("Komutlar:\n/scan - hemen piyasa tara\n/status - bot durumunu göster\n/help - yardım")
+            elif text.startswith("/status"):
+                self.telegram.send_message(self.status_text())
+            elif text.startswith("/scan"):
+                self.telegram.send_message("🔎 Manuel tarama başladı.")
+                self._run_scan(send_empty_report=True)
+                self.next_scan_at = time.time() + self.config.scan_interval_seconds
+
+    def _run_scan(self, send_empty_report: bool) -> None:
+        signals = self.engine.scan()
+        sent = 0
+        for signal in signals[:5]:
+            if self.db.recently_sent(signal.symbol, signal.side, self.config.signal_cooldown_minutes):
+                continue
+            if self.db.signals_today_count(signal.symbol) >= self.config.max_signals_per_symbol_per_day:
+                continue
+            self.telegram.send_message(format_signal_message(signal))
+            self.db.save_signal(signal)
+            sent += 1
+        if sent == 0 and send_empty_report:
+            self.telegram.send_message(
+                "📊 Tarama tamamlandı, yeni sinyal yok.\n\n"
+                f"{self.engine.last_scan_summary}\n\n"
+                "Zayıf veya tekrarlı fırsatlar elendi."
+            )
+
+    def status_text(self) -> str:
+        tp2_count, sl_count, open_count = self.db.performance_summary()
+        closed_total = tp2_count + sl_count
+        win_rate_line = ""
+        if closed_total > 0:
+            win_rate = tp2_count / closed_total * 100
+            win_rate_line = f"TP2/SL kapanan: {closed_total} (TP2: {tp2_count}, SL: {sl_count}) — kazanma oranı: {win_rate:.0f}%\n"
+        return (
+            "✅ Bot çalışıyor\n\n"
+            f"{self.engine.last_scan_summary}\n\n"
+            f"Toplam kayıtlı sinyal: {self.db.total_signals()}\n"
+            f"Açık pozisyon: {open_count}\n"
+            f"{win_rate_line}"
+            f"Minimum confidence: {self.config.min_confidence:.0f}\n"
+            f"Günlük coin limiti: {self.config.max_signals_per_symbol_per_day}\n"
+            f"Tarama aralığı: {self.config.scan_interval_seconds} sn"
+        )
+
+
+def format_signal_message(signal: Signal) -> str:
+    icon = "🟢" if signal.side == "LONG" else "🔴"
+    return (
+        "🚨 <b>NEW SIGNAL</b>\n\n"
+        f"{icon} <b>{signal.side}</b>\n\n"
+        f"🪙 Coin: <b>{signal.symbol}</b>\n"
+        f"⭐ Confidence: <b>{signal.confidence:.0f}/100</b>\n"
+        f"💰 Entry: <code>{format_price(signal.entry)}</code>\n"
+        f"🛑 Stop Loss: <code>{format_price(signal.stop_loss)}</code>\n\n"
+        f"🎯 TP1: <code>{format_price(signal.tp1)}</code>\n"
+        f"🎯 TP2: <code>{format_price(signal.tp2)}</code>\n\n"
+        f"⚡ Leverage: <b>{signal.leverage}x</b>\n"
+        f"📊 Risk/Reward: <b>{signal.risk_reward:.2f}</b>\n"
+        f"₿ BTC Status: <b>{html_escape(signal.btc_status)}</b>\n\n"
+        f"{format_reasons(signal.reasons)}\n\n"
+        f"🕒 Signal Time: {local_now_text()}"
+    )
+
+
+def format_tp_hit_message(row: sqlite3.Row, price: float, level: int) -> str:
+    entry = row["entry"]
+    side = row["side"]
+    leverage = row["leverage"] or 1
+    raw_pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+    leveraged_pct = raw_pct * leverage
+    final_note = "\n\n✅ Pozisyon tamamen kapandı." if level == 2 else "\n\nℹ️ TP2 ve Stop için takip devam ediyor."
+    return (
+        f"🎯 <b>TP{level} HIT</b>\n\n"
+        f"🪙 Coin: <b>{row['symbol']}</b>\n"
+        f"{'🟢' if side == 'LONG' else '🔴'} Yön: <b>{side}</b>\n"
+        f"💰 Giriş: <code>{format_price(entry)}</code>\n"
+        f"🎯 TP{level} Fiyatı: <code>{format_price(price)}</code>\n"
+        f"📈 Kazanç: <b>+{raw_pct:.2f}%</b> (kaldıraçlı ~<b>+{leveraged_pct:.2f}%</b>, {leverage}x)"
+        f"{final_note}\n\n"
+        f"🕒 {local_now_text()}"
+    )
+
+
+def format_sl_hit_message(row: sqlite3.Row, price: float) -> str:
+    entry = row["entry"]
+    side = row["side"]
+    leverage = row["leverage"] or 1
+    raw_pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+    leveraged_pct = raw_pct * leverage
+    return (
+        "🛑 <b>STOP LOSS HIT</b>\n\n"
+        f"🪙 Coin: <b>{row['symbol']}</b>\n"
+        f"{'🟢' if side == 'LONG' else '🔴'} Yön: <b>{side}</b>\n"
+        f"💰 Giriş: <code>{format_price(entry)}</code>\n"
+        f"🛑 Stop Fiyatı: <code>{format_price(price)}</code>\n"
+        f"📉 Kayıp: <b>{raw_pct:.2f}%</b> (kaldıraçlı ~<b>{leveraged_pct:.2f}%</b>, {leverage}x)\n\n"
+        "✅ Pozisyon kapandı.\n\n"
+        f"🕒 {local_now_text()}"
+    )
+
+
+def format_reasons(reasons: Iterable[str]) -> str:
+    allowed = {
+        "Trend confirmed": "✅ Trend Confirmed",
+        "Momentum confirmed": "✅ Momentum Confirmed",
+        "Market structure confirmed": "✅ Structure Confirmed",
+    }
+    lines = [allowed[reason] for reason in reasons if reason in allowed]
+    if any(reason.startswith("Volume confirmed") for reason in reasons):
+        lines.append("✅ Volume Confirmed")
+    if not lines:
+        lines.append("✅ Multi-layer validation passed")
+    return "\n".join(lines)
+
+
+def load_dotenv(path: str) -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as file:
+        for raw_line in file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def get_required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"{name} .env içinde doldurulmalı.")
+    return value
+
+
+def get_int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def get_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def get_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def format_price(value: float) -> str:
+    if value >= 100:
+        return f"{value:.2f}"
+    if value >= 1:
+        return f"{value:.4f}"
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+def utc_now_text() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def local_now_text() -> str:
+    # Telegram shows message-delivery time in the recipient's local timezone.
+    # Displaying the signal time in that same local timezone (instead of UTC)
+    # avoids the confusing "message says 16:29 but arrived at 19:29" mismatch —
+    # both were always the same instant, just two different timezone labels.
+    return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M (TR)")
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def html_escape(value: str) -> str:
+    return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
+    )
+
+
+def main() -> None:
+    try:
+        config = Config.load()
+        configure_logging(config.log_level)
+        SignalBot(config).run()
+    except Exception as exc:
+        print("Bot başlatılamadı:", exc)
+        print(traceback.format_exc())
+        raise
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+# No external Python packages are required.
+# The bot uses only the Python standard library.
