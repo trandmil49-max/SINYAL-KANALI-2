@@ -138,11 +138,40 @@ class TelegramClient:
         except Exception:
             logging.exception("Telegram message failed")
 
+    def delete_webhook(self) -> None:
+        """Clears any webhook left configured on this bot token.
+
+        getUpdates (long polling) and a webhook cannot be active at the same time —
+        Telegram answers getUpdates with HTTP 409 Conflict for as long as a webhook
+        is set, even if nothing else is actually polling right now. Calling this once
+        on startup makes sure polling always works regardless of what was configured
+        on this token before.
+        """
+        url = f"{TELEGRAM_BASE_URL}/bot{self.token}/deleteWebhook"
+        data = urllib.parse.urlencode({"drop_pending_updates": "false"}).encode("utf-8")
+        request = urllib.request.Request(url, data=data, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                response.read()
+        except Exception:
+            logging.exception("Telegram deleteWebhook failed")
+
     def get_updates(self) -> list[dict[str, Any]]:
         url = f"{TELEGRAM_BASE_URL}/bot{self.token}/getUpdates"
         params = {"timeout": 1, "offset": self.offset}
         try:
             updates = self.http.get_json(url, params)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                # Another consumer (a webhook, or a second running instance) is using
+                # this token's getUpdates right now. Log one short line instead of a
+                # full traceback every 2s, and back off a bit so we don't hammer
+                # Telegram while the conflict persists.
+                logging.warning("Telegram getUpdates 409 Conflict - baska bir yerde ayni token kullaniliyor olabilir.")
+                time.sleep(5)
+            else:
+                logging.exception("Telegram update polling failed (HTTP %s)", exc.code)
+            return []
         except Exception:
             logging.exception("Telegram update polling failed")
             return []
@@ -790,6 +819,7 @@ class SignalBot:
         self.next_scan_at = 0.0
 
     def run(self) -> None:
+        self.telegram.delete_webhook()
         self.telegram.send_message("✅ Binance Futures signal bot aktif.\nKomutlar: /scan /status /help")
         threading.Thread(target=self._position_monitor_loop, daemon=True).start()
         while True:
@@ -1067,4 +1097,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
