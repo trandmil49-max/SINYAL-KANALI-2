@@ -6,30 +6,65 @@ Bot emir acmaz, para yonetmez ve Binance API key istemez. Sadece analiz ve bildi
 
 ## Ozellikler
 
-- Dinamik Binance USDT perpetual sembol tarama
+- Dinamik Binance USDT perpetual sembol tarama — varsayilan olarak filtreyi gecen TUM pariteler taranir (sadece hacme gore ilk N tanesi degil)
 - Likidite ve hacim filtresi
 - BTC market sagligi kontrolu
-- Trend, momentum, volume, market structure ve risk skoru
+- 15dk / 1sa / 4sa cok-zaman-dilimli trend, momentum, volume, market structure ve risk skoru
 - Funding rate ve open interest kontrolu
 - Telegram komutlari
 - SQLite sinyal kaydi
 - Tekrar sinyal cooldown korumasi ve gunluk coin basina sinyal limiti
-- Acik pozisyonlar icin otomatik TP1 / TP2 / Stop Loss takibi ve bildirimi
+- Acik pozisyonlar icin bagimsiz bir arka plan thread'inde otomatik TP1 / TP2 / Stop Loss takibi ve bildirimi (tarama surerken bile gecikmez)
 - `/status` icinde basit kazanma orani (TP2 vs SL) ozeti
 - Windows ve Linux/macOS calistirma dosyalari
 
+## Tum Piyasayi Tarama
+
+Onceki surumde bot her taramada hacme gore sadece en yuksek `MAX_SYMBOLS_TO_ANALYZE`
+(varsayilan 80) pariteyi analiz ediyordu; bu da hep ayni buyuk hacimli birkac
+coin'in sinyal uretmesine yol aciyordu. Artik varsayilan `MAX_SYMBOLS_TO_ANALYZE=0`,
+yani `MIN_QUOTE_VOLUME_USDT` esigini gecen TUM Binance Futures USDT-M pariteleri
+her taramada analiz edilir. Belirli bir sayiyla sinirlamak isterseniz `.env`
+icinde bu degeri pozitif bir sayi yapabilirsiniz (orn. 80), ama bu durumda yine
+sadece en yuksek hacimli o kadar parite taranir.
+
 ## TP1 / TP2 / Stop Loss Bildirimleri
 
-Bot artik gonderdigi her sinyali veritabaninda "acik pozisyon" olarak isaretler ve
-`POSITION_CHECK_INTERVAL_SECONDS` degerinde belirtilen surede bir (varsayilan 30 sn)
-Binance'ten guncel fiyati cekip kontrol eder:
+Bot gonderdigi her sinyali veritabaninda "acik pozisyon" olarak isaretler ve
+bunlari `POSITION_CHECK_INTERVAL_SECONDS` degerinde belirtilen surede bir
+(varsayilan 15 sn) **ayri bir arka plan thread'inde** kontrol eder:
 
 - Fiyat TP1'e ulasirsa TP1 bildirimi gelir, pozisyon TP2/SL icin izlenmeye devam eder.
 - Fiyat TP2'ye ulasirsa TP2 bildirimi gelir ve pozisyon kapanir.
 - Fiyat Stop Loss'a ulasirsa SL bildirimi gelir ve pozisyon kapanir.
 
+Bu kontrolun ayri bir thread'de calismasi onemlidir: piyasa taramasi (ozellikle
+artik tum pariteleri tarayan surumde) uzun surebilir; TP/SL kontrolu ayni
+donguye bagli olsaydi, tarama bitene kadar TP/SL mesajlari da gecikirdi. Artik
+tarama ne kadar surerse sursun TP/SL kontrolu kendi periyodunda calismaya
+devam eder.
+
 Not: Bot sadece analiz/bildirim yapar, gercek bir pozisyon acmaz; bu takip tamamen
 kagit uzerinde (paper) fiyat karsilastirmasidir.
+
+## Cok Zaman Dilimli Teknik Analiz
+
+Skorlama artik sadece 15dk/1sa'ya degil, 4 saatlik zaman dilimindeki EMA50/EMA200
+yapisina da bakar (buyuk resmi/ana trendi teyit etmek icin). 4 saatlik trend
+sinyal yonuyle ayniysa skor artar ("4H Trend Confirmed" olarak mesajda da
+gorunur), ters yondeyse skor dusurulur. Bu, botun kisa vadeli gurultuye degil,
+daha genis bir zaman dilimindeki gercek trende gore sinyal uretmesini saglar.
+
+## Performans Notu
+
+Tum piyasayi taramak, sinirli sayida parite taramaya gore daha fazla Binance API
+cagrisi ve daha uzun tarama suresi demektir (parite basina 15dk/1sa/4sa mum verisi
++ funding + open interest = 5 istek). Yuzlerce parite oldugu icin tam bir tarama
+birkac dakika surebilir. `SCAN_INTERVAL_SECONDS` degerinin tarama suresinden kisa
+olmamasina dikkat edin; cok kisa tutarsaniz bir tarama bitmeden digeri baslamaya
+calisir. Eger tarama surekli cok uzun suruyorsa veya Binance'ten rate-limit hatasi
+almaya baslarsaniz `MAX_SYMBOLS_TO_ANALYZE` degerini pozitif bir sayiya (orn. 150)
+sabitleyerek taranan parite sayisini sinirlayabilirsiniz.
 
 ## Otomatik "Yeni Sinyal Yok" Mesajlari
 
@@ -133,3 +168,4 @@ TP2/SL istatistiklerine bakarak ayar yapmaniz gerekir.
 ## Risk Uyarisi
 
 Bu proje yatirim tavsiyesi degildir. Futures islemleri yuksek risk tasir. Bot sadece analiz ve bildirim aracidir.
+
