@@ -6,6 +6,7 @@ import math
 import os
 import sqlite3
 import statistics
+import threading
 import time
 import traceback
 import urllib.error
@@ -28,12 +29,12 @@ class Config:
     telegram_bot_token: str
     telegram_chat_id: str
     scan_interval_seconds: int = 300
-    max_symbols_to_analyze: int = 80
+    max_symbols_to_analyze: int = 0  # 0 = sinirsiz, tum uygun pariteleri tara
     min_quote_volume_usdt: float = 50_000_000
     min_confidence: float = 82
     signal_cooldown_minutes: int = 240
     max_signals_per_symbol_per_day: int = 2
-    position_check_interval_seconds: int = 30
+    position_check_interval_seconds: int = 15
     announce_empty_scans: bool = False
     binance_timeout_seconds: int = 12
     log_level: str = "INFO"
@@ -45,12 +46,12 @@ class Config:
             telegram_bot_token=get_required_env("TELEGRAM_BOT_TOKEN"),
             telegram_chat_id=get_required_env("TELEGRAM_CHAT_ID"),
             scan_interval_seconds=get_int_env("SCAN_INTERVAL_SECONDS", 300),
-            max_symbols_to_analyze=get_int_env("MAX_SYMBOLS_TO_ANALYZE", 80),
+            max_symbols_to_analyze=get_int_env("MAX_SYMBOLS_TO_ANALYZE", 0),
             min_quote_volume_usdt=get_float_env("MIN_QUOTE_VOLUME_USDT", 50_000_000),
             min_confidence=get_float_env("MIN_CONFIDENCE", 82),
             signal_cooldown_minutes=get_int_env("SIGNAL_COOLDOWN_MINUTES", 240),
             max_signals_per_symbol_per_day=get_int_env("MAX_SIGNALS_PER_SYMBOL_PER_DAY", 2),
-            position_check_interval_seconds=get_int_env("POSITION_CHECK_INTERVAL_SECONDS", 30),
+            position_check_interval_seconds=get_int_env("POSITION_CHECK_INTERVAL_SECONDS", 15),
             announce_empty_scans=get_bool_env("ANNOUNCE_EMPTY_SCANS", False),
             binance_timeout_seconds=get_int_env("BINANCE_TIMEOUT_SECONDS", 12),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -245,12 +246,13 @@ class SignalDatabase:
         self._init()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         return conn
 
     def _init(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS signals (
@@ -483,7 +485,9 @@ class ProfessionalSignalEngine:
             and not item.symbol.endswith("USDC")
         ]
         filtered.sort(key=lambda item: item.quote_volume, reverse=True)
-        return filtered[: self.config.max_symbols_to_analyze]
+        if self.config.max_symbols_to_analyze and self.config.max_symbols_to_analyze > 0:
+            return filtered[: self.config.max_symbols_to_analyze]
+        return filtered
 
     def _analyze_btc(self) -> BtcHealth:
         candles_1h = self.binance.klines("BTCUSDT", "1h", 210)
@@ -536,11 +540,13 @@ class ProfessionalSignalEngine:
     def _analyze_symbol(self, symbol: str, btc: BtcHealth) -> Signal | None:
         candles_15m = self.binance.klines(symbol, "15m", 210)
         candles_1h = self.binance.klines(symbol, "1h", 210)
+        candles_4h = self.binance.klines(symbol, "4h", 210)
         if len(candles_15m) < 100 or len(candles_1h) < 100:
             return None
 
         closes_15m = [c.close for c in candles_15m]
         closes_1h = [c.close for c in candles_1h]
+        closes_4h = [c.close for c in candles_4h]
         price = closes_15m[-1]
         atr = IndicatorEngine.atr(candles_15m)
         if atr <= 0 or price <= 0:
@@ -556,6 +562,7 @@ class ProfessionalSignalEngine:
         funding = self.binance.funding_rate(symbol)
         open_interest = self.binance.open_interest(symbol)
         structure = self._market_structure(candles_15m)
+        htf_trend = self._higher_timeframe_trend(closes_4h)
         volatility = atr / price
 
         long_score, long_reasons = self._score_direction(
@@ -575,6 +582,7 @@ class ProfessionalSignalEngine:
             structure,
             volatility,
             btc,
+            htf_trend,
         )
         short_score, short_reasons = self._score_direction(
             "SHORT",
@@ -593,6 +601,7 @@ class ProfessionalSignalEngine:
             structure,
             volatility,
             btc,
+            htf_trend,
         )
 
         if max(long_score, short_score) < self.config.min_confidence:
@@ -619,6 +628,7 @@ class ProfessionalSignalEngine:
         structure: str,
         volatility: float,
         btc: BtcHealth,
+        htf_trend: str,
     ) -> tuple[float, list[str]]:
         score = 0.0
         reasons = []
@@ -646,6 +656,15 @@ class ProfessionalSignalEngine:
         if structure_ok:
             score += 14
             reasons.append("Market structure confirmed")
+
+        htf_ok = htf_trend == ("Bullish" if bullish else "Bearish")
+        htf_conflict = htf_trend == ("Bearish" if bullish else "Bullish")
+        if htf_ok:
+            score += 12
+            reasons.append("Higher timeframe (4h) trend aligned")
+        elif htf_conflict:
+            score -= 14
+            reasons.append("Higher timeframe (4h) trend conflicting")
 
         if rel_volume >= 1.15:
             score += 12
@@ -684,6 +703,21 @@ class ProfessionalSignalEngine:
             reasons.append("Open interest available")
 
         return clamp(score, 0, 100), reasons
+
+    @staticmethod
+    def _higher_timeframe_trend(closes_4h: list[float]) -> str:
+        """Reads the 4h chart's structure (EMA50 vs EMA200) as an extra, higher-timeframe
+        confirmation layer, so the bot doesn't just react to noisy 15m/1h moves."""
+        if len(closes_4h) < 210:
+            return "Mixed"
+        price = closes_4h[-1]
+        ema50 = IndicatorEngine.ema(closes_4h, 50)[-1]
+        ema200 = IndicatorEngine.ema(closes_4h, 200)[-1]
+        if price > ema50 > ema200:
+            return "Bullish"
+        if price < ema50 < ema200:
+            return "Bearish"
+        return "Mixed"
 
     def _build_signal(self, symbol: str, side: str, confidence: float, entry: float, atr: float, reasons: list[str]) -> Signal:
         risk_distance = atr * 1.35
@@ -754,20 +788,16 @@ class SignalBot:
         self.db = SignalDatabase(DB_PATH)
         self.engine = ProfessionalSignalEngine(BinanceFuturesClient(config.binance_timeout_seconds), config)
         self.next_scan_at = 0.0
-        self.next_position_check_at = 0.0
 
     def run(self) -> None:
         self.telegram.send_message("✅ Binance Futures signal bot aktif.\nKomutlar: /scan /status /help")
+        threading.Thread(target=self._position_monitor_loop, daemon=True).start()
         while True:
             try:
                 self._handle_updates()
-                now = time.time()
-                if now >= self.next_scan_at:
+                if time.time() >= self.next_scan_at:
                     self._run_scan(send_empty_report=self.config.announce_empty_scans)
                     self.next_scan_at = time.time() + self.config.scan_interval_seconds
-                if now >= self.next_position_check_at:
-                    self._check_open_positions()
-                    self.next_position_check_at = time.time() + self.config.position_check_interval_seconds
                 time.sleep(2)
             except KeyboardInterrupt:
                 raise
@@ -775,6 +805,17 @@ class SignalBot:
                 logging.exception("Main loop error")
                 self.telegram.send_message(f"⚠️ Bot hata yakaladı ve çalışmaya devam ediyor:\n{html_escape(str(exc))}")
                 time.sleep(10)
+
+    def _position_monitor_loop(self) -> None:
+        # Runs independently of the scan loop above. A full-universe market scan can
+        # take a while (many symbols), and TP/SL checks must never wait behind it —
+        # that delay was exactly why TP/SL messages were arriving late.
+        while True:
+            try:
+                self._check_open_positions()
+            except Exception:
+                logging.exception("Position monitor loop error")
+            time.sleep(self.config.position_check_interval_seconds)
 
     def _check_open_positions(self) -> None:
         open_positions = self.db.open_positions()
@@ -927,6 +968,7 @@ def format_reasons(reasons: Iterable[str]) -> str:
         "Trend confirmed": "✅ Trend Confirmed",
         "Momentum confirmed": "✅ Momentum Confirmed",
         "Market structure confirmed": "✅ Structure Confirmed",
+        "Higher timeframe (4h) trend aligned": "✅ 4H Trend Confirmed",
     }
     lines = [allowed[reason] for reason in reasons if reason in allowed]
     if any(reason.startswith("Volume confirmed") for reason in reasons):
@@ -1025,3 +1067,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
