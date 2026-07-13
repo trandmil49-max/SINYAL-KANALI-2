@@ -13,7 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -22,6 +22,10 @@ BINANCE_BASE_URL = "https://fapi.binance.com"
 TELEGRAM_BASE_URL = "https://api.telegram.org"
 DB_PATH = "signals.db"
 LOCAL_TZ = ZoneInfo("Europe/Istanbul")
+TURKISH_MONTHS = [
+    "", "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran",
+    "Temmuz", "Ağustos", "Eylül", "Ekim", "Kasım", "Aralık",
+]
 
 
 @dataclass(frozen=True)
@@ -306,12 +310,24 @@ class SignalDatabase:
                 "tp2_hit": "INTEGER NOT NULL DEFAULT 0",
                 "sl_hit": "INTEGER NOT NULL DEFAULT 0",
                 "closed_at": "INTEGER",
+                "exit_price": "REAL",
             }
             for column, declaration in migrations.items():
                 if column not in existing_columns:
                     conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {declaration}")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_side_time ON signals(symbol, side, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status ON signals(status)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_type TEXT NOT NULL,
+                    period_key TEXT NOT NULL,
+                    sent_at INTEGER NOT NULL,
+                    UNIQUE(report_type, period_key)
+                )
+                """
+            )
 
     def recently_sent(self, symbol: str, side: str, cooldown_minutes: int) -> bool:
         cutoff = int(time.time()) - cooldown_minutes * 60
@@ -366,18 +382,18 @@ class SignalDatabase:
         with self._connect() as conn:
             conn.execute("UPDATE signals SET tp1_hit = 1 WHERE id = ?", (signal_id,))
 
-    def mark_tp2_hit(self, signal_id: int) -> None:
+    def mark_tp2_hit(self, signal_id: int, exit_price: float) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE signals SET tp2_hit = 1, status = 'TP2', closed_at = ? WHERE id = ?",
-                (int(time.time()), signal_id),
+                "UPDATE signals SET tp2_hit = 1, status = 'TP2', closed_at = ?, exit_price = ? WHERE id = ?",
+                (int(time.time()), exit_price, signal_id),
             )
 
-    def mark_sl_hit(self, signal_id: int) -> None:
+    def mark_sl_hit(self, signal_id: int, exit_price: float) -> None:
         with self._connect() as conn:
             conn.execute(
-                "UPDATE signals SET sl_hit = 1, status = 'SL', closed_at = ? WHERE id = ?",
-                (int(time.time()), signal_id),
+                "UPDATE signals SET sl_hit = 1, status = 'SL', closed_at = ?, exit_price = ? WHERE id = ?",
+                (int(time.time()), exit_price, signal_id),
             )
 
     def performance_summary(self) -> tuple[int, int, int]:
@@ -387,6 +403,28 @@ class SignalDatabase:
             sl = conn.execute("SELECT COUNT(*) AS n FROM signals WHERE status = 'SL'").fetchone()["n"]
             open_count = conn.execute("SELECT COUNT(*) AS n FROM signals WHERE status = 'OPEN'").fetchone()["n"]
         return int(tp2), int(sl), int(open_count)
+
+    def signals_between(self, start_ts: int, end_ts: int) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM signals WHERE created_at >= ? AND created_at <= ? ORDER BY created_at",
+                (start_ts, end_ts),
+            ).fetchall()
+
+    def report_already_sent(self, report_type: str, period_key: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM report_log WHERE report_type = ? AND period_key = ? LIMIT 1",
+                (report_type, period_key),
+            ).fetchone()
+        return row is not None
+
+    def mark_report_sent(self, report_type: str, period_key: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO report_log(report_type, period_key, sent_at) VALUES (?, ?, ?)",
+                (report_type, period_key, int(time.time())),
+            )
 
 
 class IndicatorEngine:
@@ -820,8 +858,9 @@ class SignalBot:
 
     def run(self) -> None:
         self.telegram.delete_webhook()
-        self.telegram.send_message("✅ Binance Futures signal bot aktif.\nKomutlar: /scan /status /help")
+        self.telegram.send_message("✅ Binance Futures signal bot aktif.\nKomutlar: /scan /status /rapor /help")
         threading.Thread(target=self._position_monitor_loop, daemon=True).start()
+        threading.Thread(target=self._report_scheduler_loop, daemon=True).start()
         while True:
             try:
                 self._handle_updates()
@@ -871,18 +910,123 @@ class SignalBot:
         # Stop loss takes priority: protecting capital is checked before targets.
         if hit_sl and not row["sl_hit"]:
             self.telegram.send_message(format_sl_hit_message(row, price))
-            self.db.mark_sl_hit(row["id"])
+            self.db.mark_sl_hit(row["id"], price)
             return
 
         if hit_tp2 and not row["tp2_hit"]:
             self.telegram.send_message(format_tp_hit_message(row, price, level=2))
-            self.db.mark_tp2_hit(row["id"])
+            self.db.mark_tp2_hit(row["id"], price)
             return
 
         if hit_tp1 and not row["tp1_hit"]:
             self.telegram.send_message(format_tp_hit_message(row, price, level=1))
             self.db.mark_tp1_hit(row["id"])
             # Position stays OPEN after TP1 so we keep watching for TP2 or SL.
+
+    def _report_scheduler_loop(self) -> None:
+        # Independent thread, same reasoning as the position monitor: report timing
+        # must not depend on how long a scan happens to take.
+        while True:
+            try:
+                self._maybe_send_scheduled_reports()
+            except Exception:
+                logging.exception("Report scheduler loop error")
+            time.sleep(30)
+
+    def _maybe_send_scheduled_reports(self) -> None:
+        now = datetime.now(LOCAL_TZ)
+        if now.hour != 23:
+            return  # reports only fire during the 23:00 TR hour
+
+        day_key = now.strftime("%Y-%m-%d")
+        if not self.db.report_already_sent("daily", day_key):
+            self._send_period_report("daily", now)
+            self.db.mark_report_sent("daily", day_key)
+
+        if now.weekday() == 6:  # Monday=0 ... Sunday=6 -> last day of the week
+            week_key = now.strftime("%G-W%V")
+            if not self.db.report_already_sent("weekly", week_key):
+                self._send_period_report("weekly", now)
+                self.db.mark_report_sent("weekly", week_key)
+
+        if self._is_last_day_of_month(now):
+            month_key = now.strftime("%Y-%m")
+            if not self.db.report_already_sent("monthly", month_key):
+                self._send_period_report("monthly", now)
+                self.db.mark_report_sent("monthly", month_key)
+
+    def _send_period_report(self, period: str, now: datetime) -> None:
+        if period == "daily":
+            start_local = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            title = f"📅 <b>GÜNLÜK ÖZET</b> — {now.strftime('%d.%m.%Y')}"
+        elif period == "weekly":
+            start_local = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now.weekday())
+            title = f"🗓️ <b>HAFTALIK ÖZET</b> — {start_local.strftime('%d.%m')} / {now.strftime('%d.%m.%Y')}"
+        else:
+            start_local = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            title = f"📆 <b>AYLIK ÖZET</b> — {TURKISH_MONTHS[now.month]} {now.year}"
+
+        rows = self.db.signals_between(int(start_local.timestamp()), int(now.timestamp()))
+        self.telegram.send_message(self._build_report_text(title, rows))
+
+    @staticmethod
+    def _is_last_day_of_month(moment: datetime) -> bool:
+        return (moment + timedelta(days=1)).day == 1
+
+    @staticmethod
+    def _build_report_text(title: str, rows: list[sqlite3.Row]) -> str:
+        def pct(row: sqlite3.Row) -> float | None:
+            entry = row["entry"]
+            exit_price = row["exit_price"]
+            if exit_price is None:
+                if row["status"] == "TP2":
+                    exit_price = row["tp2"]
+                elif row["status"] == "SL":
+                    exit_price = row["stop_loss"]
+                else:
+                    return None
+            if row["side"] == "LONG":
+                return (exit_price - entry) / entry * 100
+            return (entry - exit_price) / entry * 100
+
+        total = len(rows)
+        long_count = sum(1 for r in rows if r["side"] == "LONG")
+        short_count = sum(1 for r in rows if r["side"] == "SHORT")
+        tp2_rows = [r for r in rows if r["status"] == "TP2"]
+        sl_rows = [r for r in rows if r["status"] == "SL"]
+        open_rows = [r for r in rows if r["status"] == "OPEN"]
+        closed_rows = tp2_rows + sl_rows
+
+        lines = [title, ""]
+        lines.append(f"📡 Gönderilen sinyal: <b>{total}</b> (LONG {long_count} / SHORT {short_count})")
+        lines.append(f"🎯 TP2 (kazandı): <b>{len(tp2_rows)}</b>")
+        lines.append(f"🛑 SL (kaybetti): <b>{len(sl_rows)}</b>")
+        lines.append(f"⏳ Hâlâ açık: <b>{len(open_rows)}</b>")
+
+        if closed_rows:
+            win_rate = len(tp2_rows) / len(closed_rows) * 100
+            lines.append(f"🏆 Kazanma oranı: <b>{win_rate:.0f}%</b>")
+
+        if rows:
+            avg_conf = statistics.mean(r["confidence"] for r in rows)
+            lines.append(f"⭐ Ortalama confidence: <b>{avg_conf:.0f}</b>")
+
+        scored = [(r, pct(r)) for r in closed_rows]
+        scored = [(r, p) for r, p in scored if p is not None]
+        if scored:
+            best_row, best_pct = max(scored, key=lambda item: item[1])
+            worst_row, worst_pct = min(scored, key=lambda item: item[1])
+            lines.append("")
+            lines.append(f"🥇 En iyi işlem: <b>{best_row['symbol']}</b> {best_row['side']} ({best_pct:+.2f}%)")
+            lines.append(f"🥈 En kötü işlem: <b>{worst_row['symbol']}</b> {worst_row['side']} ({worst_pct:+.2f}%)")
+
+        if total == 0:
+            lines.append("")
+            lines.append("Bu dönemde sinyal gönderilmedi.")
+
+        lines.append("")
+        lines.append(f"🕒 {local_now_text()}")
+        return "\n".join(lines)
 
     def _handle_updates(self) -> None:
         for update in self.telegram.get_updates():
@@ -892,9 +1036,17 @@ class SignalBot:
             if chat_id and chat_id != self.config.telegram_chat_id:
                 continue
             if text.startswith("/start") or text.startswith("/help"):
-                self.telegram.send_message("Komutlar:\n/scan - hemen piyasa tara\n/status - bot durumunu göster\n/help - yardım")
+                self.telegram.send_message(
+                    "Komutlar:\n"
+                    "/scan - hemen piyasa tara\n"
+                    "/status - bot durumunu göster\n"
+                    "/rapor - bugüne ait özet raporu şimdi gönder\n"
+                    "/help - yardım"
+                )
             elif text.startswith("/status"):
                 self.telegram.send_message(self.status_text())
+            elif text.startswith("/rapor"):
+                self._send_period_report("daily", datetime.now(LOCAL_TZ))
             elif text.startswith("/scan"):
                 self.telegram.send_message("🔎 Manuel tarama başladı.")
                 self._run_scan(send_empty_report=True)
@@ -1097,3 +1249,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
