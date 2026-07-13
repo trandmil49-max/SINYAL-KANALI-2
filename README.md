@@ -15,8 +15,36 @@ Bot emir acmaz, para yonetmez ve Binance API key istemez. Sadece analiz ve bildi
 - SQLite sinyal kaydi
 - Tekrar sinyal cooldown korumasi ve gunluk coin basina sinyal limiti
 - Acik pozisyonlar icin bagimsiz bir arka plan thread'inde otomatik TP1 / TP2 / Stop Loss takibi ve bildirimi (tarama surerken bile gecikmez)
+- Turkiye saatiyle tam 23:00'da otomatik gunluk / haftalik / aylik ozet raporlari
 - `/status` icinde basit kazanma orani (TP2 vs SL) ozeti
 - Windows ve Linux/macOS calistirma dosyalari
+
+## Gunluk / Haftalik / Aylik Ozet Raporlari
+
+Bot, Turkiye saatiyle (Europe/Istanbul) her gun **tam 23:00**'da otomatik olarak
+o gune ait bir ozet mesaji gonderir. Ayrica:
+
+- Haftanin son gunu (**Pazar**) saat 23:00'da, o haftaya ait bir haftalik ozet de eklenir.
+- Ayin son gunu saat 23:00'da, o aya ait bir aylik ozet de eklenir.
+
+Yani ayin son gunu Pazar'a denk gelirse ayni anda 3 rapor (gunluk + haftalik +
+aylik) art arda gelir — bu normaldir.
+
+Her rapor sunlari icerir:
+
+- Donemde gonderilen toplam sinyal sayisi (LONG / SHORT dagilimi)
+- Kac tanesi TP2 ile kazandi, kac tanesi Stop Loss ile kaybetti, kac tanesi hala acik
+- Kazanma orani (TP2 / (TP2+SL))
+- Ortalama confidence skoru
+- O donemin en iyi islemi (en yuksek % kazanc) ve en kotu islemi (en buyuk % kayip)
+
+Raporlar veritabaninda ayrica loglanir (`report_log` tablosu), boylece bot yeniden
+baslasa bile ayni gun/hafta/ay icin rapor iki kez gonderilmez. `.env` degistirmeye
+gerek yok, bu ozellik otomatik aktiftir.
+
+Saat 23:00'i beklemeden test etmek isterseniz Telegram'dan `/rapor` komutunu
+gonderin — bu, o gune kadarki verilerle gunluk formatta bir ozeti hemen gonderir
+(rapor loguna kaydedilmez, istediginiz kadar tekrar calistirabilirsiniz).
 
 ## Tum Piyasayi Tarama
 
