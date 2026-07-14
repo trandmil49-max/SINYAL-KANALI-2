@@ -19,6 +19,27 @@ Bot emir acmaz, para yonetmez ve Binance API key istemez. Sadece analiz ve bildi
 - `/status` icinde basit kazanma orani (TP2 vs SL) ozeti
 - Windows ve Linux/macOS calistirma dosyalari
 
+## Stop Loss Cok Sik Tetikleniyordu — Duzeltildi
+
+Raporlarda SL orani cok yuksek cikiyordu (orn. 27/36 kapanan islem SL). Sebebi
+bulundu: stop mesafesi **15 dakikalik mumun ATR'inin sadece 1.35 kati** olarak
+hesaplaniyordu — bu, sikca normal fiyat "gurultusunden" (gercek bir don us
+olmadan, sadece kisa vadeli inis-cikistan) bile daha dar bir mesafeydi. Coin
+dogru yonde gitse bile, hareket gelismeden once stop'a carpiyordu.
+
+Artik stop mesafesi cok daha az "gurultulu" olan **1 saatlik ATR**'a gore
+hesaplaniyor (`atr_1h * 1.6`), TP1/TP2 hedefleri de bu daha genis birime gore
+olculuyor (risk/reward orani ayni kaliyor, ~2.25). Onerilen kaldirac da artik
+gercek stop mesafesine gore hesaplaniyor (stop ne kadar genisse, onerilen
+kaldirac o kadar dusuk).
+
+Bu bir "garanti kazanc" duzeltmesi degildir — piyasa yine de yanlis yonde
+gidebilir. Ama artik kayiplarin en azindan **gercek bir ters hareketten**
+kaynaklanmasi beklenir, dar bir stop'un normal gurultuyle tetiklenmesinden
+degil. Birkac gunluk/haftalik raporu (`/rapor` veya otomatik 23:00 raporlari)
+takip ederek kazanma oraninin nasil degistigini gorebilirsiniz; hala dusukse
+`MIN_CONFIDENCE` degerini yukseltmek bir sonraki adim olabilir.
+
 ## Gunluk / Haftalik / Aylik Ozet Raporlari
 
 Bot, Turkiye saatiyle (Europe/Istanbul) her gun **tam 23:00**'da otomatik olarak
