@@ -616,6 +616,7 @@ class ProfessionalSignalEngine:
         closes_4h = [c.close for c in candles_4h]
         price = closes_15m[-1]
         atr = IndicatorEngine.atr(candles_15m)
+        atr_1h = IndicatorEngine.atr(candles_1h)
         if atr <= 0 or price <= 0:
             return None
 
@@ -674,8 +675,8 @@ class ProfessionalSignalEngine:
         if max(long_score, short_score) < self.config.min_confidence:
             return None
         if long_score >= short_score:
-            return self._build_signal(symbol, "LONG", long_score, price, atr, long_reasons)
-        return self._build_signal(symbol, "SHORT", short_score, price, atr, short_reasons)
+            return self._build_signal(symbol, "LONG", long_score, price, atr, atr_1h, long_reasons)
+        return self._build_signal(symbol, "SHORT", short_score, price, atr, atr_1h, short_reasons)
 
     def _score_direction(
         self,
@@ -786,8 +787,15 @@ class ProfessionalSignalEngine:
             return "Bearish"
         return "Mixed"
 
-    def _build_signal(self, symbol: str, side: str, confidence: float, entry: float, atr: float, reasons: list[str]) -> Signal:
-        risk_distance = atr * 1.35
+    def _build_signal(self, symbol: str, side: str, confidence: float, entry: float, atr: float, atr_1h: float, reasons: list[str]) -> Signal:
+        # Risk distance used to be 1.35x the 15m ATR — a single 15-minute candle's
+        # average range. That's small enough that ordinary price noise (not an actual
+        # reversal) was hitting the stop before the trade thesis had time to play out,
+        # which is why SL was firing so much more often than TP. The 1h ATR is a far
+        # less noisy measure of how much this symbol actually moves, so basing the
+        # stop on it gives the trade real room to work before getting stopped out.
+        risk_unit = atr_1h if atr_1h > 0 else atr * 4
+        risk_distance = risk_unit * 1.6
         reward_1 = risk_distance * 1.45
         reward_2 = risk_distance * 2.25
         if side == "LONG":
@@ -799,7 +807,7 @@ class ProfessionalSignalEngine:
             tp1 = entry - reward_1
             tp2 = entry - reward_2
         risk_reward = abs(tp2 - entry) / abs(entry - stop_loss)
-        leverage = self._suggest_leverage(atr / entry)
+        leverage = self._suggest_leverage(risk_distance / entry)
         return Signal(
             symbol=symbol,
             side=side,
@@ -838,12 +846,15 @@ class ProfessionalSignalEngine:
         return "Mixed"
 
     @staticmethod
-    def _suggest_leverage(volatility: float) -> int:
-        if volatility <= 0.008:
+    def _suggest_leverage(stop_distance_pct: float) -> int:
+        # stop_distance_pct is how far the stop-loss sits from entry, as a fraction
+        # of price (risk_distance / entry) — a wider stop should mean lower suggested
+        # leverage to keep risk-per-trade roughly consistent across signals.
+        if stop_distance_pct <= 0.025:
             return 10
-        if volatility <= 0.015:
+        if stop_distance_pct <= 0.045:
             return 7
-        if volatility <= 0.025:
+        if stop_distance_pct <= 0.075:
             return 5
         return 3
 
