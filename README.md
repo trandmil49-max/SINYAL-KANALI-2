@@ -13,11 +13,44 @@ Bot emir acmaz, para yonetmez ve Binance API key istemez. Sadece analiz ve bildi
 - Funding rate ve open interest kontrolu
 - Telegram komutlari
 - SQLite sinyal kaydi
-- Tekrar sinyal cooldown korumasi ve gunluk coin basina sinyal limiti
+- Tekrar sinyal cooldown korumasi, gunluk coin basina sinyal limiti VE acik pozisyon varken ayni coin'e tekrar sinyal atmama korumasi
 - Acik pozisyonlar icin bagimsiz bir arka plan thread'inde otomatik TP1 / TP2 / Stop Loss takibi ve bildirimi (tarama surerken bile gecikmez)
+- TP1 vurulunca stop otomatik olarak basabasa (giris fiyatina) cekilir — kazanilan kar geri kaybedilmez
 - Turkiye saatiyle tam 23:00'da otomatik gunluk / haftalik / aylik ozet raporlari
 - `/status` icinde basit kazanma orani (TP2 vs SL) ozeti
 - Windows ve Linux/macOS calistirma dosyalari
+
+## Ayni Coin'e Ust Uste Sinyal Sorunu — Duzeltildi
+
+Bot, bir coin'de zaten acik (henuz TP2/SL/basabas ile kapanmamis) bir pozisyon
+varken, o coin filtrelerden tekrar gecse bile **artik yeni bir sinyal atmiyor**.
+Onceki davranista sadece cooldown (4 saat, ayni yon icin) ve gunluk limit
+kontrolu vardi; bu, ayni coin icin eski sinyal hala takip edilirken yeni bir
+sinyal daha gonderilmesine ve gereksiz yere cok fazla sinyal uretilmesine (orn.
+bir gunde 62 sinyal) yol aciyordu. Artik kural basit: **bir coin'de acik
+pozisyon varsa, o kapanana kadar o coin icin yeni sinyal yok.** Pozisyon TP2,
+SL veya basabas ile kapandiginda coin tekrar sinyal alabilir hale gelir. Bu,
+toplam sinyal sayisini da dogal olarak onemli olcude azaltir.
+
+## TP1 Sonrasi Basabas (Breakeven) Stop — Duzeltildi
+
+Onceki davranista, TP1 vurulup kar alindiktan sonra fiyat geri donup orijinal
+stop seviyesine giderse pozisyon **tam SL** olarak kapaniyordu — yani TP1'de
+kazanilan kar, sonrasinda tamamen geri veriliyordu. Bu, raporlarda "kazandigim
+parayi baska islemlerde geri verdim" seklinde goze carpan sorunun sebebiydi.
+
+Artik TP1 vuruldugu anda stop otomatik olarak **giris fiyatina (basabas)**
+cekiliyor. Fiyat sonra geri donerse pozisyon basabas civarinda kapanir —
+TP1'de alinan kar korunmus olur, tam kayip degil. Bu kapanis turu raporlarda ayri
+bir kategori olarak gosterilir:
+
+- 🎯 **TP2** — hedefe tam ulasti, tam kazanc
+- ⚪️ **Basabas (TP1 sonrasi)** — TP1'de kar alindi, sonra basabasa donuldu; net
+  sonuc kabaca notr, tam kayip degil
+- 🛑 **SL** — TP1'e hic ulasilmadan orijinal stop'a gidildi, gercek kayip
+
+Raporlardaki "Kazanma orani" hesabi sadece TP2 ve gercek SL'i karsilastirir,
+basabas islemler bu orana dahil edilmez (ne kazanc ne kayip sayildigi icin).
 
 ## Stop Loss Cok Sik Tetikleniyordu — Duzeltildi
 
