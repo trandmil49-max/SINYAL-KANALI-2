@@ -378,9 +378,26 @@ class SignalDatabase:
         with self._connect() as conn:
             return conn.execute("SELECT * FROM signals WHERE status = 'OPEN'").fetchall()
 
-    def mark_tp1_hit(self, signal_id: int) -> None:
+    def has_open_position(self, symbol: str) -> bool:
+        """True if this symbol already has an unresolved (OPEN) signal — used to stop
+        the bot from sending a new signal for a coin until the current one closes via
+        TP2, SL, or breakeven."""
         with self._connect() as conn:
-            conn.execute("UPDATE signals SET tp1_hit = 1 WHERE id = ?", (signal_id,))
+            row = conn.execute(
+                "SELECT 1 FROM signals WHERE symbol = ? AND status = 'OPEN' LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        return row is not None
+
+    def mark_tp1_hit(self, signal_id: int) -> None:
+        # Move the stop to breakeven (entry price) once TP1 is hit. If price later
+        # reverses, the position closes near entry instead of at the original SL —
+        # so a trade that already banked TP1 profit can no longer turn into a full loss.
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE signals SET tp1_hit = 1, stop_loss = entry WHERE id = ?",
+                (signal_id,),
+            )
 
     def mark_tp2_hit(self, signal_id: int, exit_price: float) -> None:
         with self._connect() as conn:
@@ -393,6 +410,14 @@ class SignalDatabase:
         with self._connect() as conn:
             conn.execute(
                 "UPDATE signals SET sl_hit = 1, status = 'SL', closed_at = ?, exit_price = ? WHERE id = ?",
+                (int(time.time()), exit_price, signal_id),
+            )
+
+    def mark_breakeven_hit(self, signal_id: int, exit_price: float) -> None:
+        """Closed via the post-TP1 breakeven stop — not a real loss, TP1 profit stands."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE signals SET sl_hit = 1, status = 'BE', closed_at = ?, exit_price = ? WHERE id = ?",
                 (int(time.time()), exit_price, signal_id),
             )
 
@@ -914,14 +939,21 @@ class SignalBot:
 
     def _evaluate_position(self, row: sqlite3.Row, price: float) -> None:
         side = row["side"]
-        hit_sl = price <= row["stop_loss"] if side == "LONG" else price >= row["stop_loss"]
+        hit_stop = price <= row["stop_loss"] if side == "LONG" else price >= row["stop_loss"]
         hit_tp2 = price >= row["tp2"] if side == "LONG" else price <= row["tp2"]
         hit_tp1 = price >= row["tp1"] if side == "LONG" else price <= row["tp1"]
 
-        # Stop loss takes priority: protecting capital is checked before targets.
-        if hit_sl and not row["sl_hit"]:
-            self.telegram.send_message(format_sl_hit_message(row, price))
-            self.db.mark_sl_hit(row["id"], price)
+        # Stop takes priority: protecting capital is checked before targets. Once TP1
+        # has already been hit, row["stop_loss"] has already been moved to breakeven
+        # by mark_tp1_hit, so this same check naturally becomes a breakeven-close
+        # instead of a loss once that has happened.
+        if hit_stop and not row["sl_hit"]:
+            if row["tp1_hit"]:
+                self.telegram.send_message(format_breakeven_hit_message(row, price))
+                self.db.mark_breakeven_hit(row["id"], price)
+            else:
+                self.telegram.send_message(format_sl_hit_message(row, price))
+                self.db.mark_sl_hit(row["id"], price)
             return
 
         if hit_tp2 and not row["tp2_hit"]:
@@ -932,7 +964,8 @@ class SignalBot:
         if hit_tp1 and not row["tp1_hit"]:
             self.telegram.send_message(format_tp_hit_message(row, price, level=1))
             self.db.mark_tp1_hit(row["id"])
-            # Position stays OPEN after TP1 so we keep watching for TP2 or SL.
+            # Position stays OPEN after TP1 so we keep watching for TP2 or the
+            # (now breakeven) stop.
 
     def _report_scheduler_loop(self) -> None:
         # Independent thread, same reasoning as the position monitor: report timing
@@ -1005,18 +1038,20 @@ class SignalBot:
         short_count = sum(1 for r in rows if r["side"] == "SHORT")
         tp2_rows = [r for r in rows if r["status"] == "TP2"]
         sl_rows = [r for r in rows if r["status"] == "SL"]
+        be_rows = [r for r in rows if r["status"] == "BE"]
         open_rows = [r for r in rows if r["status"] == "OPEN"]
-        closed_rows = tp2_rows + sl_rows
+        closed_rows = tp2_rows + sl_rows + be_rows
 
         lines = [title, ""]
         lines.append(f"📡 Gönderilen sinyal: <b>{total}</b> (LONG {long_count} / SHORT {short_count})")
         lines.append(f"🎯 TP2 (kazandı): <b>{len(tp2_rows)}</b>")
+        lines.append(f"⚪️ Başabaş (TP1 sonrası): <b>{len(be_rows)}</b>")
         lines.append(f"🛑 SL (kaybetti): <b>{len(sl_rows)}</b>")
         lines.append(f"⏳ Hâlâ açık: <b>{len(open_rows)}</b>")
 
-        if closed_rows:
-            win_rate = len(tp2_rows) / len(closed_rows) * 100
-            lines.append(f"🏆 Kazanma oranı: <b>{win_rate:.0f}%</b>")
+        if tp2_rows or sl_rows:
+            win_rate = len(tp2_rows) / (len(tp2_rows) + len(sl_rows)) * 100
+            lines.append(f"🏆 Kazanma oranı: <b>{win_rate:.0f}%</b> (TP2 vs gerçek SL, başabaş hariç)")
 
         if rows:
             avg_conf = statistics.mean(r["confidence"] for r in rows)
@@ -1067,6 +1102,8 @@ class SignalBot:
         signals = self.engine.scan()
         sent = 0
         for signal in signals[:5]:
+            if self.db.has_open_position(signal.symbol):
+                continue
             if self.db.recently_sent(signal.symbol, signal.side, self.config.signal_cooldown_minutes):
                 continue
             if self.db.signals_today_count(signal.symbol) >= self.config.max_signals_per_symbol_per_day:
@@ -1152,6 +1189,24 @@ def format_sl_hit_message(row: sqlite3.Row, price: float) -> str:
         f"🛑 Stop Fiyatı: <code>{format_price(price)}</code>\n"
         f"📉 Kayıp: <b>{raw_pct:.2f}%</b> (kaldıraçlı ~<b>{leveraged_pct:.2f}%</b>, {leverage}x)\n\n"
         "✅ Pozisyon kapandı.\n\n"
+        f"🕒 {local_now_text()}"
+    )
+
+
+def format_breakeven_hit_message(row: sqlite3.Row, price: float) -> str:
+    entry = row["entry"]
+    side = row["side"]
+    leverage = row["leverage"] or 1
+    raw_pct = (price - entry) / entry * 100 if side == "LONG" else (entry - price) / entry * 100
+    leveraged_pct = raw_pct * leverage
+    return (
+        "⚪️ <b>BREAKEVEN (TP1 sonrası)</b>\n\n"
+        f"🪙 Coin: <b>{row['symbol']}</b>\n"
+        f"{'🟢' if side == 'LONG' else '🔴'} Yön: <b>{side}</b>\n"
+        f"💰 Giriş: <code>{format_price(entry)}</code>\n"
+        f"⚪️ Kapanış Fiyatı: <code>{format_price(price)}</code>\n"
+        f"📊 Net: <b>{raw_pct:+.2f}%</b> (kaldıraçlı ~<b>{leveraged_pct:+.2f}%</b>, {leverage}x)\n\n"
+        "✅ TP1 kârı korundu, pozisyon başabaşta kapandı (tam SL değil).\n\n"
         f"🕒 {local_now_text()}"
     )
 
