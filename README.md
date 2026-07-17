@@ -10,6 +10,7 @@ Bot emir acmaz, para yonetmez ve Binance API key istemez. Sadece analiz ve bildi
 - Likidite ve hacim filtresi
 - BTC market sagligi kontrolu
 - 15dk / 1sa / 4sa cok-zaman-dilimli trend, momentum, volume, market structure ve risk skoru
+- **Sert filtreler (hard gate):** trend, yapi, ADX, 4H uyumu, BTC durumu ve "zaten pompalanmis coin" kontrolu artik puan kaybettirmiyor, direkt eliyor — asagida detayli anlatildi
 - Funding rate ve open interest kontrolu
 - Telegram komutlari
 - SQLite sinyal kaydi
@@ -19,6 +20,74 @@ Bot emir acmaz, para yonetmez ve Binance API key istemez. Sadece analiz ve bildi
 - Turkiye saatiyle tam 23:00'da otomatik gunluk / haftalik / aylik ozet raporlari
 - `/status` icinde basit kazanma orani (TP2 vs SL) ozeti
 - Windows ve Linux/macOS calistirma dosyalari
+
+## Teknik Analiz Koklu Degisiklik: Az Ama Kaliteli Sinyal
+
+Onceki sistemde her kriter (trend, yapi, ADX, 4H uyumu, BTC durumu) sadece puan
+kazandiriyor/kaybettiriyordu — yani bir coin trend'i tutmasa bile diger
+kriterlerden topladigi puanla yine de esik degeri (confidence) gecebiliyordu.
+Bu, "bazi seyler uyuyor" seviyesindeki zayif kurulumlarin bile sinyal olarak
+gitmesine yol aciyordu — cok fazla sinyal, dusuk isabet orani.
+
+Artik asagidaki kriterlerin **HEPSI** ayni anda saglanmadan bir coin
+degerlendirmeye bile alinmiyor (puan degil, direkt eleme):
+
+- **Trend** (15dk/1sa EMA yapisi) yon ile uyumlu olmali
+- **Piyasa yapisi** (higher-high/higher-low vb.) yon ile uyumlu olmali
+- **ADX >= 20** olmali (piyasa gercekten trend'de olmali, yatay/kararsiz
+  piyasada sinyal uretilmez)
+- **4 saatlik zaman dilimi** ters yonde olmamali
+- **BTC durumu** "Dangerous" olmamali
+- **YENI: "Zaten pompalanmis coin" filtresi** — coin son 6 saatte zaten
+  %12'den fazla hareket ettiyse (yon ile ayni yonde), o coin icin sinyal
+  **uretilmez**. Ekran goruntulerinde gordugumuz PUMPUSDT ve USUSDT
+  kayiplari tam olarak bu desene uyuyordu: fiyat zaten dikine firlamisken
+  bot buna "momentum/hacim onaylandi" diyerek atlamaya calisiyordu — halbuki
+  bu, hareketin baslangici degil cogu zaman sonunun isaretiydi. Artik boyle
+  bir kurulum otomatik olarak elenir.
+
+Bu kriterlerin hepsini ayni anda gecen kurulumlar zaten azdir, bu yuzden
+`MIN_CONFIDENCE` varsayilani da 82'den **86**'ya cekildi (ek bir guvenlik
+katmani olarak). Sonuc: gunluk sinyal sayisinin belirgin sekilde azalmasi ve
+kalan sinyallerin cok daha secici filtrelerden gecmis olmasi beklenir.
+
+**Durustce soylemek gerekirse:** Hicbir kural seti belirli bir kazanma
+oranini (orn. %70-80) garanti edemez — kripto piyasasi tahmin edilemez
+kalmaya devam eder ve gercek zararli haberler / ani likidasyon dalgalari her
+zaman olabilir. Bu degisiklik "botun piyasayi okuma kalitesini" somut,
+gerekce lendirilmis kriterlerle yukseltiyor (ozellikle pompalanmis coin
+kovalama sorununu kokten kapatiyor), ama garanti degil. `/rapor` ve gunluk
+ozetlerle birkac gun/hafta izleyip sonuclari gormek en dogrusu.
+
+## Ayni Coin'e Tekrar Sinyal Sorunu Hala Goruluyorsa — ONEMLI
+
+Kod tarafinda "acik pozisyon varken o coin'e yeni sinyal atma" korumasi zaten
+var ve test edildi (bkz. asagidaki "Ayni Coin'e Ust Uste Sinyal Sorunu"
+bolumu) — ayni anda calisan TEK bir bot process'i icin bu koruma %100
+calisir. Ama ekran goruntusunde ayni dakika icinde SUIUSDT ve LTCUSDT icin
+neredeyse ayni (fiyati bir tik farkli) iki ayri sinyal gorduk. Bunun kod
+hatasi degil, **altyapi (deploy) kaynakli** olma ihtimali cok yuksek. Iki
+olasi sebep:
+
+1. **`signals.db` kalici (persistent) bir diskte durmuyor olabilir.** Bircok
+   deploy platformu (Railway dahil) her yeniden deploy'da veya container
+   yeniden baslattiginda dosya sistemini sifirlar — eger `signals.db` icin
+   ozel bir "Volume" (kalici disk) baglanmadiysa, her redeploy'da veritabani
+   bombos baslar. Bu durumda bot, az once ayni coin icin actigi pozisyonu
+   "hatirlayamaz" ve coin'i sanki hic sinyal atilmamis gibi tekrar
+   degerlendirir. Deploy panelinde "Volume" / "Persistent Disk" / "Storage"
+   gibi bir ayar arayip `signals.db`'nin bulundugu klasore kalici bir disk
+   baglamaniz gerekebilir.
+2. **Ayni bot ayni anda birden fazla kopya (replica/instance) olarak
+   calisiyor olabilir.** Deploy platformunda "Replicas" veya "Instances"
+   sayisi 1'den fazlaysa, her kopyanin **kendi ayri** `signals.db`'si olur;
+   biri bir coin icin sinyal actiginda digeri bundan habersiz oldugu icin
+   ayni coin'e kendi tarafindan da sinyal atabilir. Daha once yasadigimiz
+   Telegram "409 Conflict" hatasi da aslinda bunun bir belirtisi olabilir.
+   Deploy panelinde replica/instance sayisinin **1** oldugunu kontrol edin.
+
+Bu ikisi de kod degisikligiyle degil, deploy/altyapi ayarlarinizla cozulur;
+kod zaten tek bir process icin dogru calisiyor (test edildi).
 
 ## Ayni Coin'e Ust Uste Sinyal Sorunu — Duzeltildi
 
