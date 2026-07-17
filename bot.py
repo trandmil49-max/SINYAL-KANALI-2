@@ -35,7 +35,7 @@ class Config:
     scan_interval_seconds: int = 300
     max_symbols_to_analyze: int = 0  # 0 = sinirsiz, tum uygun pariteleri tara
     min_quote_volume_usdt: float = 50_000_000
-    min_confidence: float = 82
+    min_confidence: float = 86
     signal_cooldown_minutes: int = 240
     max_signals_per_symbol_per_day: int = 2
     position_check_interval_seconds: int = 15
@@ -52,7 +52,7 @@ class Config:
             scan_interval_seconds=get_int_env("SCAN_INTERVAL_SECONDS", 300),
             max_symbols_to_analyze=get_int_env("MAX_SYMBOLS_TO_ANALYZE", 0),
             min_quote_volume_usdt=get_float_env("MIN_QUOTE_VOLUME_USDT", 50_000_000),
-            min_confidence=get_float_env("MIN_CONFIDENCE", 82),
+            min_confidence=get_float_env("MIN_CONFIDENCE", 86),
             signal_cooldown_minutes=get_int_env("SIGNAL_COOLDOWN_MINUTES", 240),
             max_signals_per_symbol_per_day=get_int_env("MAX_SIGNALS_PER_SYMBOL_PER_DAY", 2),
             position_check_interval_seconds=get_int_env("POSITION_CHECK_INTERVAL_SECONDS", 15),
@@ -658,43 +658,34 @@ class ProfessionalSignalEngine:
         htf_trend = self._higher_timeframe_trend(closes_4h)
         volatility = atr / price
 
-        long_score, long_reasons = self._score_direction(
-            "LONG",
-            price,
-            ema20[-1],
-            ema50[-1],
-            ema200_1h[-1],
-            rsi,
-            macd_line,
-            macd_signal,
-            macd_hist,
-            adx,
-            rel_volume,
-            funding,
-            open_interest,
-            structure,
-            volatility,
-            btc,
-            htf_trend,
+        # How far price has already run in the last 6 hourly candles. Chasing a coin
+        # that already moved a lot very recently (a pump already in progress) is a
+        # well-known high-risk entry — it's much more likely to be the coin's brief top
+        # than the start of a fresh trend. This is a hard reject, not a scoring nudge.
+        extension_pct = 0.0
+        if len(closes_1h) >= 7 and closes_1h[-7] > 0:
+            extension_pct = (closes_1h[-1] - closes_1h[-7]) / closes_1h[-7]
+
+        long_gate_ok = self._passes_hard_filters(
+            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct
         )
-        short_score, short_reasons = self._score_direction(
-            "SHORT",
-            price,
-            ema20[-1],
-            ema50[-1],
-            ema200_1h[-1],
-            rsi,
-            macd_line,
-            macd_signal,
-            macd_hist,
-            adx,
-            rel_volume,
-            funding,
-            open_interest,
-            structure,
-            volatility,
-            btc,
-            htf_trend,
+        short_gate_ok = self._passes_hard_filters(
+            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct
+        )
+
+        long_score, long_reasons = (
+            self._score_direction(
+                "LONG", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
+                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend,
+            )
+            if long_gate_ok else (0.0, [])
+        )
+        short_score, short_reasons = (
+            self._score_direction(
+                "SHORT", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
+                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend,
+            )
+            if short_gate_ok else (0.0, [])
         )
 
         if max(long_score, short_score) < self.config.min_confidence:
@@ -702,6 +693,43 @@ class ProfessionalSignalEngine:
         if long_score >= short_score:
             return self._build_signal(symbol, "LONG", long_score, price, atr, atr_1h, long_reasons)
         return self._build_signal(symbol, "SHORT", short_score, price, atr, atr_1h, short_reasons)
+
+    @staticmethod
+    def _passes_hard_filters(
+        bullish: bool,
+        price: float,
+        ema20: float,
+        ema50: float,
+        ema200_1h: float,
+        adx: float,
+        structure: str,
+        htf_trend: str,
+        btc: BtcHealth,
+        extension_pct: float,
+    ) -> bool:
+        """A direction must clear ALL of these before its weighted score even counts.
+        This used to all be soft, additive scoring (lose some points here, make it up
+        there) — which let setups through where only some things lined up. These are
+        the conditions that mattered most for actually reading the market correctly,
+        so now they gate the direction out entirely rather than just costing points."""
+        trend_ok = (price > ema20 > ema50 and price > ema200_1h) if bullish else (price < ema20 < ema50 and price < ema200_1h)
+        if not trend_ok:
+            return False
+        if structure != ("Bullish" if bullish else "Bearish"):
+            return False
+        if adx < 20:
+            return False  # market isn't actually trending, too choppy to trust a directional call
+        if htf_trend == ("Bearish" if bullish else "Bullish"):
+            return False  # 4h chart disagrees with the trade direction
+        if btc.status == "Dangerous":
+            return False
+        # Already-extended move in the same direction (a pump already in progress) —
+        # chasing it here is much riskier than catching it early.
+        if bullish and extension_pct > 0.12:
+            return False
+        if not bullish and extension_pct < -0.12:
+            return False
+        return True
 
     def _score_direction(
         self,
