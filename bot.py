@@ -840,7 +840,12 @@ class ProfessionalSignalEngine:
             return "Bearish"
         return "Mixed"
 
-    def _build_signal(self, symbol: str, side: str, confidence: float, entry: float, atr: float, atr_1h: float, reasons: list[str]) -> Signal:
+    # If the stop distance itself is this wide (as % of price), the coin is too
+    # volatile to risk-manage sanely even with reduced leverage — skip it entirely
+    # rather than send a trade whose worst case is still a huge loss.
+    MAX_STOP_DISTANCE_PCT = 0.08
+
+    def _build_signal(self, symbol: str, side: str, confidence: float, entry: float, atr: float, atr_1h: float, reasons: list[str]) -> Signal | None:
         # Risk distance used to be 1.35x the 15m ATR — a single 15-minute candle's
         # average range. That's small enough that ordinary price noise (not an actual
         # reversal) was hitting the stop before the trade thesis had time to play out,
@@ -849,6 +854,9 @@ class ProfessionalSignalEngine:
         # stop on it gives the trade real room to work before getting stopped out.
         risk_unit = atr_1h if atr_1h > 0 else atr * 4
         risk_distance = risk_unit * 1.6
+        stop_distance_pct = risk_distance / entry
+        if stop_distance_pct > self.MAX_STOP_DISTANCE_PCT:
+            return None  # too volatile to risk-manage — e.g. this is what let a -36% leveraged loss through on 1000XECUSDT
         reward_1 = risk_distance * 1.45
         reward_2 = risk_distance * 2.25
         if side == "LONG":
@@ -860,7 +868,7 @@ class ProfessionalSignalEngine:
             tp1 = entry - reward_1
             tp2 = entry - reward_2
         risk_reward = abs(tp2 - entry) / abs(entry - stop_loss)
-        leverage = self._suggest_leverage(risk_distance / entry)
+        leverage = self._suggest_leverage(stop_distance_pct)
         return Signal(
             symbol=symbol,
             side=side,
@@ -900,16 +908,16 @@ class ProfessionalSignalEngine:
 
     @staticmethod
     def _suggest_leverage(stop_distance_pct: float) -> int:
-        # stop_distance_pct is how far the stop-loss sits from entry, as a fraction
-        # of price (risk_distance / entry) — a wider stop should mean lower suggested
-        # leverage to keep risk-per-trade roughly consistent across signals.
-        if stop_distance_pct <= 0.025:
-            return 10
-        if stop_distance_pct <= 0.045:
-            return 7
-        if stop_distance_pct <= 0.075:
-            return 5
-        return 3
+        # A trade like 1000XECUSDT (stop 7.28% away, 5x leverage -> a ~36% leveraged
+        # loss on a single stop-out) is way too much risk for one trade. Leverage now
+        # scales so the WORST CASE (stop hit) lands near a fixed target loss (~12% of
+        # margin) regardless of how wide the stop is — a wider stop gets proportionally
+        # lower leverage instead of a coarse bucket that could still multiply out huge.
+        target_loss_pct = 0.12
+        if stop_distance_pct <= 0:
+            return 2
+        raw_leverage = target_loss_pct / stop_distance_pct
+        return int(clamp(round(raw_leverage), 2, 10))
 
 
 class SignalBot:
@@ -1126,7 +1134,33 @@ class SignalBot:
                 self._run_scan(send_empty_report=True)
                 self.next_scan_at = time.time() + self.config.scan_interval_seconds
 
+    US_MARKET_OPEN_TZ = ZoneInfo("America/New_York")
+
+    @classmethod
+    def _in_us_market_open_window(cls, now_local: datetime) -> bool:
+        """NYSE/NASDAQ open (9:30 AM ET) reliably brings a burst of volume and, per
+        observation, can sharply reverse whatever direction crypto was drifting in all
+        day — likely tied to US equity / spot-BTC-ETF flows. We can't fetch live
+        NASDAQ/SPX data here (no network access in this environment to build or test
+        that against), so instead of guessing at an untested integration, this avoids
+        opening NEW positions in a caution window around that known, fixed time.
+        Existing open positions are unaffected — TP/SL monitoring keeps running as normal.
+        Does not account for US market holidays."""
+        ny_time = now_local.astimezone(cls.US_MARKET_OPEN_TZ)
+        if ny_time.weekday() >= 5:  # Saturday/Sunday -> US market isn't open anyway
+            return False
+        window_start = ny_time.replace(hour=9, minute=15, second=0, microsecond=0)
+        window_end = ny_time.replace(hour=10, minute=30, second=0, microsecond=0)
+        return window_start <= ny_time <= window_end
+
     def _run_scan(self, send_empty_report: bool) -> None:
+        if self._in_us_market_open_window(datetime.now(LOCAL_TZ)):
+            if send_empty_report:
+                self.telegram.send_message(
+                    "⏸️ ABD borsası açılış penceresi (yüksek volatilite / ani yön değişimi riski). "
+                    "Bu aralıkta yeni sinyal aranmıyor, açık pozisyonlar normal şekilde takip ediliyor."
+                )
+            return
         signals = self.engine.scan()
         sent = 0
         for signal in signals[:5]:
