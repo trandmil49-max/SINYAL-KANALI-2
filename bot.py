@@ -89,6 +89,7 @@ class BtcHealth:
     score: float
     volatility: float
     details: list[str]
+    pct_change_24h: float = 0.0
 
 
 @dataclass
@@ -627,7 +628,8 @@ class ProfessionalSignalEngine:
             status = "Cautious"
         else:
             status = "Dangerous"
-        return BtcHealth(status=status, direction=direction, score=score, volatility=volatility, details=details)
+        pct_change_24h = (closes[-1] - closes[-25]) / closes[-25] if len(closes) >= 25 and closes[-25] > 0 else 0.0
+        return BtcHealth(status=status, direction=direction, score=score, volatility=volatility, details=details, pct_change_24h=pct_change_24h)
 
     def _analyze_symbol(self, symbol: str, btc: BtcHealth) -> Signal | None:
         candles_15m = self.binance.klines(symbol, "15m", 210)
@@ -666,11 +668,22 @@ class ProfessionalSignalEngine:
         if len(closes_1h) >= 7 and closes_1h[-7] > 0:
             extension_pct = (closes_1h[-1] - closes_1h[-7]) / closes_1h[-7]
 
+        # Proxy for BTC-dominance-style rotation: is capital moving into this specific
+        # coin relative to BTC, or is BTC eating its relative strength? Binance doesn't
+        # publish an actual BTC.D/USDT.D index (that's a cross-exchange aggregate only
+        # data providers like CoinGecko compute, and this environment has no network
+        # access to fetch that) — this compares the coin's own 24h move against BTC's
+        # 24h move using data already being pulled, as a workable substitute.
+        alt_pct_change_24h = 0.0
+        if len(closes_1h) >= 25 and closes_1h[-25] > 0:
+            alt_pct_change_24h = (closes_1h[-1] - closes_1h[-25]) / closes_1h[-25]
+        relative_strength_vs_btc = alt_pct_change_24h - btc.pct_change_24h
+
         long_gate_ok = self._passes_hard_filters(
-            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct
+            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
         )
         short_gate_ok = self._passes_hard_filters(
-            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct
+            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
         )
 
         long_score, long_reasons = (
@@ -691,8 +704,8 @@ class ProfessionalSignalEngine:
         if max(long_score, short_score) < self.config.min_confidence:
             return None
         if long_score >= short_score:
-            return self._build_signal(symbol, "LONG", long_score, price, atr, atr_1h, long_reasons)
-        return self._build_signal(symbol, "SHORT", short_score, price, atr, atr_1h, short_reasons)
+            return self._build_signal(symbol, "LONG", long_score, price, atr, atr_1h, long_reasons, btc.status)
+        return self._build_signal(symbol, "SHORT", short_score, price, atr, atr_1h, short_reasons, btc.status)
 
     @staticmethod
     def _passes_hard_filters(
@@ -706,6 +719,7 @@ class ProfessionalSignalEngine:
         htf_trend: str,
         btc: BtcHealth,
         extension_pct: float,
+        relative_strength_vs_btc: float,
     ) -> bool:
         """A direction must clear ALL of these before its weighted score even counts.
         This used to all be soft, additive scoring (lose some points here, make it up
@@ -723,11 +737,27 @@ class ProfessionalSignalEngine:
             return False  # 4h chart disagrees with the trade direction
         if btc.status == "Dangerous":
             return False
+        # BTC's own trend directly opposing the trade direction used to only cost
+        # points (soft penalty), not block the trade. Alts overwhelmingly follow BTC's
+        # dominant move — a short fired while BTC is trending up (or a long while BTC
+        # is trending down) is fighting the tape, which is exactly the whipsaw pattern
+        # described: shorts run over as BTC ripped up, then longs given right as BTC
+        # rolled over. "Mixed" BTC direction still allows either side.
+        if btc.direction == ("Bearish" if bullish else "Bullish"):
+            return False
         # Already-extended move in the same direction (a pump already in progress) —
         # chasing it here is much riskier than catching it early.
         if bullish and extension_pct > 0.12:
             return False
         if not bullish and extension_pct < -0.12:
+            return False
+        # BTC-dominance-style check: is this coin meaningfully lagging BTC's own
+        # strength (capital isn't rotating in) when going LONG, or meaningfully
+        # beating BTC (real buying interest working against the thesis) when
+        # going SHORT? Either is a headwind for the trade.
+        if bullish and relative_strength_vs_btc < -0.08:
+            return False
+        if not bullish and relative_strength_vs_btc > 0.08:
             return False
         return True
 
@@ -845,7 +875,10 @@ class ProfessionalSignalEngine:
     # rather than send a trade whose worst case is still a huge loss.
     MAX_STOP_DISTANCE_PCT = 0.08
 
-    def _build_signal(self, symbol: str, side: str, confidence: float, entry: float, atr: float, atr_1h: float, reasons: list[str]) -> Signal | None:
+    def _build_signal(
+        self, symbol: str, side: str, confidence: float, entry: float, atr: float, atr_1h: float,
+        reasons: list[str], btc_status: str,
+    ) -> Signal | None:
         # Risk distance used to be 1.35x the 15m ATR — a single 15-minute candle's
         # average range. That's small enough that ordinary price noise (not an actual
         # reversal) was hitting the stop before the trade thesis had time to play out,
@@ -879,7 +912,7 @@ class ProfessionalSignalEngine:
             tp2=tp2,
             leverage=leverage,
             risk_reward=risk_reward,
-            btc_status=reasons[1].replace("BTC status supportive: ", "") if len(reasons) > 1 else "Checked",
+            btc_status=btc_status,
             reasons=reasons,
         )
 
@@ -1099,7 +1132,10 @@ class SignalBot:
             best_row, best_pct = max(scored, key=lambda item: item[1])
             worst_row, worst_pct = min(scored, key=lambda item: item[1])
             lines.append("")
-            lines.append(f"🥇 En iyi işlem: <b>{best_row['symbol']}</b> {best_row['side']} ({best_pct:+.2f}%)")
+            if best_pct > 0:
+                lines.append(f"🥇 En iyi işlem: <b>{best_row['symbol']}</b> {best_row['side']} ({best_pct:+.2f}%)")
+            else:
+                lines.append("🥇 En iyi işlem: bu dönemde kâr eden işlem olmadı")
             lines.append(f"🥈 En kötü işlem: <b>{worst_row['symbol']}</b> {worst_row['side']} ({worst_pct:+.2f}%)")
 
         if total == 0:
@@ -1154,7 +1190,8 @@ class SignalBot:
         return window_start <= ny_time <= window_end
 
     def _run_scan(self, send_empty_report: bool) -> None:
-        if self._in_us_market_open_window(datetime.now(LOCAL_TZ)):
+        now_local = datetime.now(LOCAL_TZ)
+        if self._in_us_market_open_window(now_local):
             if send_empty_report:
                 self.telegram.send_message(
                     "⏸️ ABD borsası açılış penceresi (yüksek volatilite / ani yön değişimi riski). "
@@ -1233,7 +1270,7 @@ def format_tp_hit_message(row: sqlite3.Row, price: float, level: int) -> str:
         f"🎯 TP{level} Fiyatı: <code>{format_price(price)}</code>\n"
         f"📈 Kazanç: <b>+{raw_pct:.2f}%</b> (kaldıraçlı ~<b>+{leveraged_pct:.2f}%</b>, {leverage}x)"
         f"{final_note}\n\n"
-        f"🕒 {local_now_text()}"
+        f"{format_position_timing(row)}"
     )
 
 
@@ -1251,7 +1288,7 @@ def format_sl_hit_message(row: sqlite3.Row, price: float) -> str:
         f"🛑 Stop Fiyatı: <code>{format_price(price)}</code>\n"
         f"📉 Kayıp: <b>{raw_pct:.2f}%</b> (kaldıraçlı ~<b>{leveraged_pct:.2f}%</b>, {leverage}x)\n\n"
         "✅ Pozisyon kapandı.\n\n"
-        f"🕒 {local_now_text()}"
+        f"{format_position_timing(row)}"
     )
 
 
@@ -1269,7 +1306,7 @@ def format_breakeven_hit_message(row: sqlite3.Row, price: float) -> str:
         f"⚪️ Kapanış Fiyatı: <code>{format_price(price)}</code>\n"
         f"📊 Net: <b>{raw_pct:+.2f}%</b> (kaldıraçlı ~<b>{leveraged_pct:+.2f}%</b>, {leverage}x)\n\n"
         "✅ TP1 kârı korundu, pozisyon başabaşta kapandı (tam SL değil).\n\n"
-        f"🕒 {local_now_text()}"
+        f"{format_position_timing(row)}"
     )
 
 
@@ -1346,6 +1383,26 @@ def local_now_text() -> str:
     # avoids the confusing "message says 16:29 but arrived at 19:29" mismatch —
     # both were always the same instant, just two different timezone labels.
     return datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %H:%M (TR)")
+
+
+def format_local_time(epoch_seconds: int) -> str:
+    return datetime.fromtimestamp(epoch_seconds, LOCAL_TZ).strftime("%Y-%m-%d %H:%M (TR)")
+
+
+def format_position_timing(row: sqlite3.Row) -> str:
+    """Açılış/kapanış saatleri ve pozisyonun ne kadar açık kaldığı — TP/SL/breakeven
+    mesajlarında gösterilir."""
+    opened_at = row["created_at"]
+    closed_at = int(time.time())
+    duration_seconds = max(0, closed_at - opened_at)
+    hours, remainder = divmod(duration_seconds, 3600)
+    minutes = remainder // 60
+    duration_text = f"{hours} sa {minutes} dk" if hours else f"{minutes} dk"
+    return (
+        f"🕒 Açılış: {format_local_time(opened_at)}\n"
+        f"🕒 Kapanış: {local_now_text()}\n"
+        f"⏱️ Süre: {duration_text}"
+    )
 
 
 def clamp(value: float, low: float, high: float) -> float:
