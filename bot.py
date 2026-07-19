@@ -120,10 +120,10 @@ class HttpClient:
 
 
 class MacroClient:
-    """Fetches the S&P 500's intraday direction as a proxy for "is there a broad
-    risk-on/risk-off macro flow happening right now" — ETF-driven Bitcoin moves are
-    correlated with this, which is the exact whipsaw pattern reported (crypto reversing
-    hard when US equities open and move).
+    """Fetches the S&P 500 and NASDAQ Composite intraday direction as a proxy for
+    "is there a broad risk-on/risk-off macro flow happening right now" — ETF-driven
+    Bitcoin moves are correlated with this, which is the exact whipsaw pattern
+    reported (crypto reversing hard when US equities open and move).
 
     IMPORTANT: this talks to a third-party endpoint (Yahoo Finance's public chart API,
     no key required) that could not be exercised from the development environment this
@@ -138,12 +138,12 @@ class MacroClient:
     def __init__(self, timeout_seconds: int) -> None:
         self.http = HttpClient(timeout_seconds)
 
-    def us_equities_trend(self) -> str:
-        """Returns 'Bullish', 'Bearish', 'Mixed', or 'Unknown' (fetch failed —
-        treated the same as 'Mixed': doesn't block either trade direction)."""
+    def _fetch_index_pct_change(self, yahoo_ticker: str) -> float | None:
+        """Returns the intraday % change for one index, or None if the fetch/parse
+        failed for any reason. Never raises."""
         try:
             data = self.http.get_json(
-                "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}",
                 params={"interval": "5m", "range": "1d"},
                 headers={
                     "User-Agent": (
@@ -157,16 +157,28 @@ class MacroClient:
             current = meta.get("regularMarketPrice")
             previous = meta.get("chartPreviousClose") or meta.get("previousClose")
             if not current or not previous:
-                return "Unknown"
-            pct_change = (current - previous) / previous
-            if pct_change > 0.003:
-                return "Bullish"
-            if pct_change < -0.003:
-                return "Bearish"
-            return "Mixed"
+                return None
+            return (current - previous) / previous
         except Exception:
-            logging.exception("US equities trend fetch failed (non-fatal, treated as Unknown)")
+            logging.exception("%s fetch failed (non-fatal, ignored)", yahoo_ticker)
+            return None
+
+    def us_equities_trend(self) -> str:
+        """Returns 'Bullish', 'Bearish', 'Mixed', or 'Unknown'. Combines S&P 500
+        (^GSPC) and NASDAQ Composite (^IXIC) — if only one of the two fetches
+        succeeds, uses that one; if both fail, 'Unknown' (doesn't block either
+        trade direction, same as 'Mixed')."""
+        spx_change = self._fetch_index_pct_change("%5EGSPC")
+        nasdaq_change = self._fetch_index_pct_change("%5EIXIC")
+        changes = [c for c in (spx_change, nasdaq_change) if c is not None]
+        if not changes:
             return "Unknown"
+        avg_change = sum(changes) / len(changes)
+        if avg_change > 0.003:
+            return "Bullish"
+        if avg_change < -0.003:
+            return "Bearish"
+        return "Mixed"
 
 
 class TelegramClient:
@@ -386,6 +398,20 @@ class SignalDatabase:
             row = conn.execute(
                 "SELECT 1 FROM signals WHERE symbol = ? AND side = ? AND created_at >= ? LIMIT 1",
                 (symbol, side, cutoff),
+            ).fetchone()
+        return row is not None
+
+    def recently_closed(self, symbol: str, cooldown_minutes: int) -> bool:
+        """True if this symbol had a position CLOSE (TP2/SL/breakeven) within the
+        cooldown window, on either side. The open-time cooldown alone isn't enough:
+        if a position stays open longer than the cooldown itself, closing it no
+        longer blocks anything, and a new signal can fire on the same coin within
+        minutes of the last one resolving. This adds a cooldown from CLOSE time too."""
+        cutoff = int(time.time()) - cooldown_minutes * 60
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM signals WHERE symbol = ? AND closed_at IS NOT NULL AND closed_at >= ? LIMIT 1",
+                (symbol, cutoff),
             ).fetchone()
         return row is not None
 
@@ -615,7 +641,7 @@ class ProfessionalSignalEngine:
         self.last_scan_summary = (
             f"Son tarama: {local_now_text()}\n"
             f"BTC: {btc_health.status} ({btc_health.direction}, skor {btc_health.score:.0f})\n"
-            f"ABD Piyasası (S&P 500): {us_trend}\n"
+            f"ABD Piyasası (S&P 500 + NASDAQ): {us_trend}\n"
             f"Analiz edilen: {len(candidates)}\n"
             f"Reddedilen: {rejected}\n"
             f"Sinyal adayı: {len(signals)}\n"
@@ -1265,6 +1291,8 @@ class SignalBot:
         for signal in signals[:5]:
             if self.db.has_open_position(signal.symbol):
                 continue
+            if self.db.recently_closed(signal.symbol, self.config.signal_cooldown_minutes):
+                continue
             if self.db.recently_sent(signal.symbol, signal.side, self.config.signal_cooldown_minutes):
                 continue
             if self.db.signals_today_count(signal.symbol) >= self.config.max_signals_per_symbol_per_day:
@@ -1496,3 +1524,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
