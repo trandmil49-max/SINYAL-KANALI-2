@@ -111,12 +111,62 @@ class HttpClient:
     def __init__(self, timeout_seconds: int) -> None:
         self.timeout_seconds = timeout_seconds
 
-    def get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:
+    def get_json(self, url: str, params: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> Any:
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
-        request = urllib.request.Request(url, headers={"User-Agent": "professional-signal-bot/1.0"})
+        request = urllib.request.Request(url, headers=headers or {"User-Agent": "professional-signal-bot/1.0"})
         with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
+
+
+class MacroClient:
+    """Fetches the S&P 500's intraday direction as a proxy for "is there a broad
+    risk-on/risk-off macro flow happening right now" — ETF-driven Bitcoin moves are
+    correlated with this, which is the exact whipsaw pattern reported (crypto reversing
+    hard when US equities open and move).
+
+    IMPORTANT: this talks to a third-party endpoint (Yahoo Finance's public chart API,
+    no key required) that could not be exercised from the development environment this
+    bot was written in — that sandbox has no network access, so unlike every other
+    piece of this file, this one specific integration could not be tested end-to-end
+    before being shipped. It is written defensively so that ANY failure (blocked,
+    timed out, response format changed, anything) degrades to "Unknown" and never
+    blocks signal generation — worst case, this filter silently does nothing.
+    Check /status after deploying to see what it's actually reading.
+    """
+
+    def __init__(self, timeout_seconds: int) -> None:
+        self.http = HttpClient(timeout_seconds)
+
+    def us_equities_trend(self) -> str:
+        """Returns 'Bullish', 'Bearish', 'Mixed', or 'Unknown' (fetch failed —
+        treated the same as 'Mixed': doesn't block either trade direction)."""
+        try:
+            data = self.http.get_json(
+                "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC",
+                params={"interval": "5m", "range": "1d"},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    ),
+                    "Accept": "application/json",
+                },
+            )
+            meta = data["chart"]["result"][0]["meta"]
+            current = meta.get("regularMarketPrice")
+            previous = meta.get("chartPreviousClose") or meta.get("previousClose")
+            if not current or not previous:
+                return "Unknown"
+            pct_change = (current - previous) / previous
+            if pct_change > 0.003:
+                return "Bullish"
+            if pct_change < -0.003:
+                return "Bearish"
+            return "Mixed"
+        except Exception:
+            logging.exception("US equities trend fetch failed (non-fatal, treated as Unknown)")
+            return "Unknown"
 
 
 class TelegramClient:
@@ -533,12 +583,16 @@ class ProfessionalSignalEngine:
     def __init__(self, binance: BinanceFuturesClient, config: Config) -> None:
         self.binance = binance
         self.config = config
+        self.macro = MacroClient(config.binance_timeout_seconds)
         self.last_scan_summary = "Henüz tarama yapılmadı."
+        self.last_us_trend = "Unknown"
 
     def scan(self) -> list[Signal]:
         started = time.time()
         candidates = self._fast_filter_symbols()
         btc_health = self._analyze_btc()
+        us_trend = self.macro.us_equities_trend()
+        self.last_us_trend = us_trend
         signals = []
         rejected = 0
 
@@ -546,7 +600,7 @@ class ProfessionalSignalEngine:
             if market_symbol.symbol == "BTCUSDT":
                 continue
             try:
-                signal = self._analyze_symbol(market_symbol.symbol, btc_health)
+                signal = self._analyze_symbol(market_symbol.symbol, btc_health, us_trend)
             except Exception:
                 rejected += 1
                 logging.exception("Symbol analysis failed: %s", market_symbol.symbol)
@@ -561,6 +615,7 @@ class ProfessionalSignalEngine:
         self.last_scan_summary = (
             f"Son tarama: {local_now_text()}\n"
             f"BTC: {btc_health.status} ({btc_health.direction}, skor {btc_health.score:.0f})\n"
+            f"ABD Piyasası (S&P 500): {us_trend}\n"
             f"Analiz edilen: {len(candidates)}\n"
             f"Reddedilen: {rejected}\n"
             f"Sinyal adayı: {len(signals)}\n"
@@ -631,7 +686,7 @@ class ProfessionalSignalEngine:
         pct_change_24h = (closes[-1] - closes[-25]) / closes[-25] if len(closes) >= 25 and closes[-25] > 0 else 0.0
         return BtcHealth(status=status, direction=direction, score=score, volatility=volatility, details=details, pct_change_24h=pct_change_24h)
 
-    def _analyze_symbol(self, symbol: str, btc: BtcHealth) -> Signal | None:
+    def _analyze_symbol(self, symbol: str, btc: BtcHealth, us_trend: str) -> Signal | None:
         candles_15m = self.binance.klines(symbol, "15m", 210)
         candles_1h = self.binance.klines(symbol, "1h", 210)
         candles_4h = self.binance.klines(symbol, "4h", 210)
@@ -680,10 +735,10 @@ class ProfessionalSignalEngine:
         relative_strength_vs_btc = alt_pct_change_24h - btc.pct_change_24h
 
         long_gate_ok = self._passes_hard_filters(
-            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
+            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, us_trend
         )
         short_gate_ok = self._passes_hard_filters(
-            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
+            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, us_trend
         )
 
         long_score, long_reasons = (
@@ -720,6 +775,7 @@ class ProfessionalSignalEngine:
         btc: BtcHealth,
         extension_pct: float,
         relative_strength_vs_btc: float,
+        us_trend: str,
     ) -> bool:
         """A direction must clear ALL of these before its weighted score even counts.
         This used to all be soft, additive scoring (lose some points here, make it up
@@ -758,6 +814,12 @@ class ProfessionalSignalEngine:
         if bullish and relative_strength_vs_btc < -0.08:
             return False
         if not bullish and relative_strength_vs_btc > 0.08:
+            return False
+        # US equities (S&P 500) trending directly against the trade — this is the
+        # ETF-flow-driven reversal pattern described (crypto flipping hard when US
+        # markets open and move). "Mixed" and "Unknown" (fetch failed) both allow
+        # either side — this never blocks anything unless we have a clear reading.
+        if us_trend == ("Bearish" if bullish else "Bullish"):
             return False
         return True
 
@@ -1434,4 +1496,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
