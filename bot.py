@@ -38,7 +38,7 @@ class Config:
     min_confidence: float = 86
     signal_cooldown_minutes: int = 240
     max_signals_per_symbol_per_day: int = 2
-    position_check_interval_seconds: int = 15
+    position_check_interval_seconds: int = 8
     announce_empty_scans: bool = False
     binance_timeout_seconds: int = 12
     log_level: str = "INFO"
@@ -55,7 +55,7 @@ class Config:
             min_confidence=get_float_env("MIN_CONFIDENCE", 86),
             signal_cooldown_minutes=get_int_env("SIGNAL_COOLDOWN_MINUTES", 240),
             max_signals_per_symbol_per_day=get_int_env("MAX_SIGNALS_PER_SYMBOL_PER_DAY", 2),
-            position_check_interval_seconds=get_int_env("POSITION_CHECK_INTERVAL_SECONDS", 15),
+            position_check_interval_seconds=get_int_env("POSITION_CHECK_INTERVAL_SECONDS", 8),
             announce_empty_scans=get_bool_env("ANNOUNCE_EMPTY_SCANS", False),
             binance_timeout_seconds=get_int_env("BINANCE_TIMEOUT_SECONDS", 12),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -761,29 +761,37 @@ class ProfessionalSignalEngine:
         relative_strength_vs_btc = alt_pct_change_24h - btc.pct_change_24h
 
         long_gate_ok = self._passes_hard_filters(
-            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, us_trend
+            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
         )
         short_gate_ok = self._passes_hard_filters(
-            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, us_trend
+            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
         )
 
         long_score, long_reasons = (
             self._score_direction(
                 "LONG", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
-                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend,
+                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend, us_trend,
             )
             if long_gate_ok else (0.0, [])
         )
         short_score, short_reasons = (
             self._score_direction(
                 "SHORT", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
-                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend,
+                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend, us_trend,
             )
             if short_gate_ok else (0.0, [])
         )
 
-        if max(long_score, short_score) < self.config.min_confidence:
+        long_qualifies = long_score >= self.config.min_confidence
+        short_qualifies = short_score >= (self.config.min_confidence + self.SHORT_EXTRA_CONFIRMATION)
+
+        if not long_qualifies and not short_qualifies:
             return None
+        if long_qualifies and not short_qualifies:
+            return self._build_signal(symbol, "LONG", long_score, price, atr, atr_1h, long_reasons, btc.status)
+        if short_qualifies and not long_qualifies:
+            return self._build_signal(symbol, "SHORT", short_score, price, atr, atr_1h, short_reasons, btc.status)
+        # Both qualify -- same tie-break as before, pick whichever scored higher.
         if long_score >= short_score:
             return self._build_signal(symbol, "LONG", long_score, price, atr, atr_1h, long_reasons, btc.status)
         return self._build_signal(symbol, "SHORT", short_score, price, atr, atr_1h, short_reasons, btc.status)
@@ -801,13 +809,18 @@ class ProfessionalSignalEngine:
         btc: BtcHealth,
         extension_pct: float,
         relative_strength_vs_btc: float,
-        us_trend: str,
     ) -> bool:
         """A direction must clear ALL of these before its weighted score even counts.
         This used to all be soft, additive scoring (lose some points here, make it up
         there) — which let setups through where only some things lined up. These are
         the conditions that mattered most for actually reading the market correctly,
-        so now they gate the direction out entirely rather than just costing points."""
+        so now they gate the direction out entirely rather than just costing points.
+
+        NOTE: US equities (S&P/NASDAQ) direction is deliberately NOT a hard gate here
+        — crypto and US equities are correlated most of the time (ETF flows) but not
+        reliably enough to let it single-handedly veto an otherwise well-confirmed
+        crypto-native setup (they do decouple — US up while crypto drops, and vice
+        versa). It's used as a soft scoring input in _score_direction instead."""
         trend_ok = (price > ema20 > ema50 and price > ema200_1h) if bullish else (price < ema20 < ema50 and price < ema200_1h)
         if not trend_ok:
             return False
@@ -824,9 +837,20 @@ class ProfessionalSignalEngine:
         # dominant move — a short fired while BTC is trending up (or a long while BTC
         # is trending down) is fighting the tape, which is exactly the whipsaw pattern
         # described: shorts run over as BTC ripped up, then longs given right as BTC
-        # rolled over. "Mixed" BTC direction still allows either side.
-        if btc.direction == ("Bearish" if bullish else "Bullish"):
-            return False
+        # rolled over.
+        #
+        # This is deliberately ASYMMETRIC: LONG still allows "Mixed" BTC direction,
+        # but SHORT now requires BTC to be clearly "Bearish" — not just "not Bullish".
+        # Crypto has a structural upward bias (ETF inflows, dip-buying culture, short
+        # squeezes) that makes shorting inherently riskier than the mirror-image logic
+        # suggests. This followed a day where every single SHORT signal (14/14) hit
+        # its stop, while LONG-only signals the next day performed meaningfully better.
+        if bullish:
+            if btc.direction == "Bearish":
+                return False
+        else:
+            if btc.direction != "Bearish":
+                return False
         # Already-extended move in the same direction (a pump already in progress) —
         # chasing it here is much riskier than catching it early.
         if bullish and extension_pct > 0.12:
@@ -840,12 +864,6 @@ class ProfessionalSignalEngine:
         if bullish and relative_strength_vs_btc < -0.08:
             return False
         if not bullish and relative_strength_vs_btc > 0.08:
-            return False
-        # US equities (S&P 500) trending directly against the trade — this is the
-        # ETF-flow-driven reversal pattern described (crypto flipping hard when US
-        # markets open and move). "Mixed" and "Unknown" (fetch failed) both allow
-        # either side — this never blocks anything unless we have a clear reading.
-        if us_trend == ("Bearish" if bullish else "Bullish"):
             return False
         return True
 
@@ -868,6 +886,7 @@ class ProfessionalSignalEngine:
         volatility: float,
         btc: BtcHealth,
         htf_trend: str,
+        us_trend: str,
     ) -> tuple[float, list[str]]:
         score = 0.0
         reasons = []
@@ -904,6 +923,20 @@ class ProfessionalSignalEngine:
         elif htf_conflict:
             score -= 14
             reasons.append("Higher timeframe (4h) trend conflicting")
+
+        # Soft input, not a gate: crypto tracks US equities (ETF flows) MOST of the
+        # time but genuinely decouples sometimes — US up while crypto drops, or the
+        # reverse. A small nudge here can't by itself block a setup where the
+        # crypto-native signals (trend/structure/momentum/BTC) are all strongly
+        # confirmed; it only matters at the margin.
+        us_ok = us_trend == ("Bullish" if bullish else "Bearish")
+        us_conflict = us_trend == ("Bearish" if bullish else "Bullish")
+        if us_ok:
+            score += 6
+            reasons.append("US equities (S&P/NASDAQ) aligned")
+        elif us_conflict:
+            score -= 6
+            reasons.append("US equities (S&P/NASDAQ) conflicting")
 
         if rel_volume >= 1.15:
             score += 12
@@ -962,6 +995,12 @@ class ProfessionalSignalEngine:
     # volatile to risk-manage sanely even with reduced leverage — skip it entirely
     # rather than send a trade whose worst case is still a huge loss.
     MAX_STOP_DISTANCE_PCT = 0.08
+
+    # SHORT must clear a HIGHER confidence bar than LONG — crypto's structural upward
+    # bias means a short needs to be a noticeably stronger setup to justify the same
+    # risk. Added after a day where 14/14 SHORT signals hit their stop while LONG-only
+    # signals the next day performed meaningfully better.
+    SHORT_EXTRA_CONFIRMATION = 6
 
     def _build_signal(
         self, symbol: str, side: str, confidence: float, entry: float, atr: float, atr_1h: float,
@@ -1193,6 +1232,7 @@ class SignalBot:
         total = len(rows)
         long_count = sum(1 for r in rows if r["side"] == "LONG")
         short_count = sum(1 for r in rows if r["side"] == "SHORT")
+        tp1_reached_count = sum(1 for r in rows if r["tp1_hit"])
         tp2_rows = [r for r in rows if r["status"] == "TP2"]
         sl_rows = [r for r in rows if r["status"] == "SL"]
         be_rows = [r for r in rows if r["status"] == "BE"]
@@ -1201,6 +1241,7 @@ class SignalBot:
 
         lines = [title, ""]
         lines.append(f"📡 Gönderilen sinyal: <b>{total}</b> (LONG {long_count} / SHORT {short_count})")
+        lines.append(f"🎯 TP1'e ulaştı (en az bir kez): <b>{tp1_reached_count}</b>")
         lines.append(f"🎯 TP2 (kazandı): <b>{len(tp2_rows)}</b>")
         lines.append(f"⚪️ Başabaş (TP1 sonrası): <b>{len(be_rows)}</b>")
         lines.append(f"🛑 SL (kaybetti): <b>{len(sl_rows)}</b>")
