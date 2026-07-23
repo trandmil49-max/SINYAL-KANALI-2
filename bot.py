@@ -832,21 +832,22 @@ class ProfessionalSignalEngine:
             return False  # 4h chart disagrees with the trade direction
         if btc.status == "Dangerous":
             return False
-        # BTC's own trend directly opposing the trade direction used to only cost
-        # points (soft penalty), not block the trade. Alts overwhelmingly follow BTC's
-        # dominant move — a short fired while BTC is trending up (or a long while BTC
-        # is trending down) is fighting the tape, which is exactly the whipsaw pattern
-        # described: shorts run over as BTC ripped up, then longs given right as BTC
-        # rolled over.
+        # BTC's own trend directly opposing (or failing to clearly support) the trade
+        # direction used to only cost points (soft penalty), not block the trade.
+        # Alts overwhelmingly follow BTC's dominant move.
         #
-        # This is deliberately ASYMMETRIC: LONG still allows "Mixed" BTC direction,
-        # but SHORT now requires BTC to be clearly "Bearish" — not just "not Bullish".
-        # Crypto has a structural upward bias (ETF inflows, dip-buying culture, short
-        # squeezes) that makes shorting inherently riskier than the mirror-image logic
-        # suggests. This followed a day where every single SHORT signal (14/14) hit
-        # its stop, while LONG-only signals the next day performed meaningfully better.
+        # This requires STRICT alignment on BOTH sides now — "Mixed" BTC direction no
+        # longer passes for either LONG or SHORT. It was briefly asymmetric (Mixed
+        # allowed for LONG, blocked for SHORT) after a day where 14/14 SHORT signals
+        # failed while LONG did better. But a later day showed 23/23 signals were LONG
+        # and still failed badly (13 SL, 1 TP2) — proving the real problem wasn't
+        # "LONG is safer than SHORT", it's that "Mixed" BTC gives no real edge for
+        # EITHER direction, and whichever side the bot happened to lean on that day
+        # was essentially a coin flip. Now neither direction fires unless BTC's own
+        # trend is unambiguous — during genuinely uncertain (Mixed) periods, expect
+        # fewer or zero signals rather than a guess in either direction.
         if bullish:
-            if btc.direction == "Bearish":
+            if btc.direction != "Bullish":
                 return False
         else:
             if btc.direction != "Bearish":
