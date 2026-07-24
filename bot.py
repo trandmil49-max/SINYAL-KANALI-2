@@ -615,8 +615,24 @@ class ProfessionalSignalEngine:
 
     def scan(self) -> list[Signal]:
         started = time.time()
-        candidates = self._fast_filter_symbols()
-        btc_health = self._analyze_btc()
+        try:
+            candidates = self._fast_filter_symbols()
+            btc_health = self._analyze_btc()
+        except Exception:
+            # This was the actual cause of the "Connection reset by peer" crashes: a
+            # transient network hiccup on the ticker list or BTC klines fetch used to
+            # propagate all the way up and abort the ENTIRE scan (every candidate,
+            # not just one symbol) — which meant a single momentary blip could mean
+            # zero signals for that cycle, or even the rest of the day if it kept
+            # recurring. Per-symbol analysis below was already protected the same way;
+            # this brings the setup phase in line with it. Skip this cycle cleanly and
+            # let the next one (in SCAN_INTERVAL_SECONDS) retry normally.
+            logging.exception("Scan setup failed (ticker list or BTC data) — skipping this cycle")
+            self.last_scan_summary = (
+                f"Son tarama: {local_now_text()}\n"
+                "Piyasa verisi çekilemedi (geçici ağ hatası), bu tarama atlandı — bir sonraki taramada tekrar denenecek."
+            )
+            return []
         us_trend = self.macro.us_equities_trend()
         self.last_us_trend = us_trend
         signals = []
@@ -1088,6 +1104,7 @@ class SignalBot:
         self.db = SignalDatabase(DB_PATH)
         self.engine = ProfessionalSignalEngine(BinanceFuturesClient(config.binance_timeout_seconds), config)
         self.next_scan_at = 0.0
+        self._last_error_text: str | None = None
 
     def run(self) -> None:
         self.telegram.delete_webhook()
@@ -1100,12 +1117,23 @@ class SignalBot:
                 if time.time() >= self.next_scan_at:
                     self._run_scan(send_empty_report=self.config.announce_empty_scans)
                     self.next_scan_at = time.time() + self.config.scan_interval_seconds
+                self._last_error_text = None  # clear once any iteration succeeds cleanly
                 time.sleep(2)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 logging.exception("Main loop error")
-                self.telegram.send_message(f"⚠️ Bot hata yakaladı ve çalışmaya devam ediyor:\n{html_escape(str(exc))}")
+                error_text = str(exc)
+                # Only notify on a NEW error, not a repeat of the same one every ~12s —
+                # this is what was causing the repeated identical "Connection reset by
+                # peer" messages. It still logs every time (visible in deploy logs),
+                # just doesn't re-send the same Telegram message on every retry.
+                if error_text != self._last_error_text:
+                    self.telegram.send_message(f"⚠️ Bot hata yakaladı ve çalışmaya devam ediyor:\n{html_escape(error_text)}")
+                self._last_error_text = error_text
+                # Back off to the normal scan cadence instead of retrying every ~12s —
+                # a persistent issue shouldn't turn into a hammering retry loop.
+                self.next_scan_at = time.time() + self.config.scan_interval_seconds
                 time.sleep(10)
 
     def _position_monitor_loop(self) -> None:
