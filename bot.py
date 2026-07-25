@@ -335,6 +335,23 @@ class BinanceFuturesClient:
             logging.info("Open interest unavailable for %s", symbol)
             return None
 
+    def long_short_ratio(self, symbol: str) -> float | None:
+        """Global long/short ACCOUNT ratio (how many accounts are net long vs net
+        short) — a very lopsided ratio (crowded long or crowded short) is a
+        contrarian, squeeze-risk signal: it's exactly the kind of imbalance that
+        precedes a liquidity-sweep reversal. Same Binance API family as
+        funding_rate/open_interest above (fapi.binance.com), not a new/different
+        service — same reliability profile as those already-working calls."""
+        try:
+            data = self.http.get_json(
+                f"{BINANCE_BASE_URL}/futures/data/globalLongShortAccountRatio",
+                {"symbol": symbol, "period": "15m", "limit": 1},
+            )
+            return float(data[0]["longShortRatio"])
+        except Exception:
+            logging.info("Long/short ratio unavailable for %s", symbol)
+            return None
+
 
 class SignalDatabase:
     def __init__(self, path: str) -> None:
@@ -753,6 +770,7 @@ class ProfessionalSignalEngine:
         rel_volume = self._relative_volume(candles_15m)
         funding = self.binance.funding_rate(symbol)
         open_interest = self.binance.open_interest(symbol)
+        long_short_ratio = self.binance.long_short_ratio(symbol)
         structure = self._market_structure(candles_15m)
         htf_trend = self._higher_timeframe_trend(closes_4h)
         volatility = atr / price
@@ -776,24 +794,26 @@ class ProfessionalSignalEngine:
             alt_pct_change_24h = (closes_1h[-1] - closes_1h[-25]) / closes_1h[-25]
         relative_strength_vs_btc = alt_pct_change_24h - btc.pct_change_24h
 
+        liquidity_sweep = self._detect_liquidity_sweep(candles_15m)
+
         long_gate_ok = self._passes_hard_filters(
-            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
+            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep
         )
         short_gate_ok = self._passes_hard_filters(
-            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc
+            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep
         )
 
         long_score, long_reasons = (
             self._score_direction(
                 "LONG", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
-                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend, us_trend,
+                adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend,
             )
             if long_gate_ok else (0.0, [])
         )
         short_score, short_reasons = (
             self._score_direction(
                 "SHORT", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
-                adx, rel_volume, funding, open_interest, structure, volatility, btc, htf_trend, us_trend,
+                adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend,
             )
             if short_gate_ok else (0.0, [])
         )
@@ -825,6 +845,7 @@ class ProfessionalSignalEngine:
         btc: BtcHealth,
         extension_pct: float,
         relative_strength_vs_btc: float,
+        liquidity_sweep: str,
     ) -> bool:
         """A direction must clear ALL of these before its weighted score even counts.
         This used to all be soft, additive scoring (lose some points here, make it up
@@ -882,6 +903,15 @@ class ProfessionalSignalEngine:
             return False
         if not bullish and relative_strength_vs_btc > 0.08:
             return False
+        # Liquidity sweep / fakeout: the entry candle itself just poked to a new local
+        # high (or low) and got rejected back inside the prior range with a long wick
+        # — a classic stop-hunt, not real continuation. This is exactly the reported
+        # pattern: a spike to a new high with a long upper wick, read as a bullish
+        # breakout, immediately followed by a hard reversal down.
+        if bullish and liquidity_sweep == "BearishSweep":
+            return False
+        if not bullish and liquidity_sweep == "BullishSweep":
+            return False
         return True
 
     def _score_direction(
@@ -899,6 +929,7 @@ class ProfessionalSignalEngine:
         rel_volume: float,
         funding: float | None,
         open_interest: float | None,
+        long_short_ratio: float | None,
         structure: str,
         volatility: float,
         btc: BtcHealth,
@@ -991,6 +1022,25 @@ class ProfessionalSignalEngine:
             score += 2
             reasons.append("Open interest available")
 
+        # Contrarian: a heavily lopsided long/short account ratio means one side of
+        # the market is crowded -- exactly the kind of imbalance that precedes a
+        # squeeze / liquidity-sweep reversal against the crowded side.
+        if long_short_ratio is not None:
+            if bullish:
+                if long_short_ratio > 2.5:
+                    score -= 6
+                    reasons.append("Long/short oranı çok kalabalık long (sıkışma riski)")
+                elif long_short_ratio < 0.7:
+                    score += 4
+                    reasons.append("Long/short oranı LONG lehine destekleyici")
+            else:
+                if long_short_ratio < 0.4:
+                    score -= 6
+                    reasons.append("Long/short oranı çok kalabalık short (sıkışma riski)")
+                elif long_short_ratio > 1.5:
+                    score += 4
+                    reasons.append("Long/short oranı SHORT lehine destekleyici")
+
         return clamp(score, 0, 100), reasons
 
     @staticmethod
@@ -1082,6 +1132,40 @@ class ProfessionalSignalEngine:
         if second_high < first_high and second_low < first_low:
             return "Bearish"
         return "Mixed"
+
+    @staticmethod
+    def _detect_liquidity_sweep(candles: list[Candle]) -> str:
+        """Classic 'liquidity sweep' / stop-hunt / fakeout (Smart Money Concepts /
+        Wyckoff 'upthrust' and 'spring'): price pokes past a recent swing high or low
+        — often triggering breakout buyers and resting stop orders — then FAILS to
+        hold and closes back inside the prior range, typically leaving a long wick.
+        This is the exact pattern reported: a sharp spike to a new local high with a
+        long upper wick, immediately followed by a hard reversal down — the bot read
+        that spike as bullish breakout confirmation instead of recognizing it as a
+        fakeout top. Returns 'BearishSweep' (fake breakout up, favors NOT going long
+        here), 'BullishSweep' (fake breakdown, favors NOT going short here), or
+        'None'."""
+        if len(candles) < 22:
+            return "None"
+        lookback = candles[-22:-2]  # recent swing range, excluding the most recent 2 candles
+        last = candles[-1]
+        prior_high = max(c.high for c in lookback)
+        prior_low = min(c.low for c in lookback)
+        candle_range = last.high - last.low
+        if candle_range <= 0:
+            return "None"
+        upper_wick = last.high - max(last.open, last.close)
+        lower_wick = min(last.open, last.close) - last.low
+
+        swept_high = last.high > prior_high and last.close < prior_high
+        if swept_high and upper_wick > candle_range * 0.4:
+            return "BearishSweep"
+
+        swept_low = last.low < prior_low and last.close > prior_low
+        if swept_low and lower_wick > candle_range * 0.4:
+            return "BullishSweep"
+
+        return "None"
 
     @staticmethod
     def _suggest_leverage(stop_distance_pct: float) -> int:
