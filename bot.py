@@ -706,9 +706,15 @@ class ProfessionalSignalEngine:
         adx = IndicatorEngine.adx(candles_1h)
         price = closes[-1]
         volatility = atr / price if price else 0
+        pct_change_24h = (closes[-1] - closes[-25]) / closes[-25] if len(closes) >= 25 and closes[-25] > 0 else 0.0
         score = 50
         details = []
 
+        # EMA50-vs-EMA200 structure confirms an ESTABLISHED trend well, but it's a
+        # lagging signal — the (very slow-moving) 200-period average can take days to
+        # catch up, so a genuinely sharp single-day move can still show up as "Mixed"
+        # here even though price already moved a lot. pct_change_24h is a faster,
+        # more responsive fallback for exactly that case.
         if price > ema50 > ema200:
             score += 22
             direction = "Bullish"
@@ -717,9 +723,38 @@ class ProfessionalSignalEngine:
             score += 22
             direction = "Bearish"
             details.append("BTC EMA yapısı negatif")
+        elif pct_change_24h <= -0.03:
+            direction = "Bearish"
+            details.append("BTC 24 saatte sert düştü")
+        elif pct_change_24h >= 0.03:
+            direction = "Bullish"
+            details.append("BTC 24 saatte sert yükseldi")
         else:
             direction = "Mixed"
             details.append("BTC trendi karışık")
+
+        # Recovery override: both the EMA structure AND the 24h-change fallback above
+        # are still looking BACKWARD (what already happened). If BTC's own most recent
+        # candles show the move already stalling/reversing — a higher low right after
+        # a "Bearish" read, or a lower high right after "Bullish" — keep calling it
+        # Bearish/Bullish is stale and dangerous: it's exactly how a routine dip inside
+        # an uptrend gets misread as a fresh downtrend right as it turns back up,
+        # which is what let a wave of SHORT signals fire straight into a rally.
+        if len(candles_1h) >= 12:
+            recent = candles_1h[-6:]
+            prior = candles_1h[-12:-6]
+            if direction == "Bearish":
+                recent_low = min(c.low for c in recent)
+                prior_low = min(c.low for c in prior)
+                if recent_low > prior_low:
+                    direction = "Mixed"
+                    details.append("BTC toparlanma belirtisi gösteriyor, Bearish okuma iptal edildi")
+            elif direction == "Bullish":
+                recent_high = max(c.high for c in recent)
+                prior_high = max(c.high for c in prior)
+                if recent_high < prior_high:
+                    direction = "Mixed"
+                    details.append("BTC zayıflama belirtisi gösteriyor, Bullish okuma iptal edildi")
 
         if 45 <= rsi <= 68:
             score += 10
@@ -742,7 +777,6 @@ class ProfessionalSignalEngine:
             status = "Cautious"
         else:
             status = "Dangerous"
-        pct_change_24h = (closes[-1] - closes[-25]) / closes[-25] if len(closes) >= 25 and closes[-25] > 0 else 0.0
         return BtcHealth(status=status, direction=direction, score=score, volatility=volatility, details=details, pct_change_24h=pct_change_24h)
 
     def _analyze_symbol(self, symbol: str, btc: BtcHealth, us_trend: str) -> Signal | None:
