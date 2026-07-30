@@ -38,6 +38,8 @@ class Config:
     min_confidence: float = 86
     signal_cooldown_minutes: int = 240
     max_signals_per_symbol_per_day: int = 2
+    max_same_direction_signals: int = 5
+    same_direction_window_minutes: int = 180
     position_check_interval_seconds: int = 8
     announce_empty_scans: bool = False
     binance_timeout_seconds: int = 12
@@ -55,6 +57,8 @@ class Config:
             min_confidence=get_float_env("MIN_CONFIDENCE", 86),
             signal_cooldown_minutes=get_int_env("SIGNAL_COOLDOWN_MINUTES", 240),
             max_signals_per_symbol_per_day=get_int_env("MAX_SIGNALS_PER_SYMBOL_PER_DAY", 2),
+            max_same_direction_signals=get_int_env("MAX_SAME_DIRECTION_SIGNALS", 5),
+            same_direction_window_minutes=get_int_env("SAME_DIRECTION_WINDOW_MINUTES", 180),
             position_check_interval_seconds=get_int_env("POSITION_CHECK_INTERVAL_SECONDS", 8),
             announce_empty_scans=get_bool_env("ANNOUNCE_EMPTY_SCANS", False),
             binance_timeout_seconds=get_int_env("BINANCE_TIMEOUT_SECONDS", 12),
@@ -439,6 +443,21 @@ class SignalDatabase:
             row = conn.execute(
                 "SELECT COUNT(*) AS n FROM signals WHERE symbol = ? AND created_at >= ?",
                 (symbol, cutoff),
+            ).fetchone()
+        return int(row["n"])
+
+    def same_direction_count(self, side: str, window_minutes: int) -> int:
+        """How many signals (across ALL symbols) were sent in this SAME direction
+        within the rolling window. A per-cycle cap alone isn't enough: if the same
+        macro read (e.g. BTC bearish) holds across several consecutive scans, a fresh
+        batch of same-side signals keeps going out each cycle — 12 signals that are
+        really just the same directional bet repeated 12 times, so when that one call
+        is wrong, all 12 fail together. This caps aggregate exposure to one direction."""
+        cutoff = int(time.time()) - window_minutes * 60
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM signals WHERE side = ? AND created_at >= ?",
+                (side, cutoff),
             ).fetchone()
         return int(row["n"])
 
@@ -829,12 +848,13 @@ class ProfessionalSignalEngine:
         relative_strength_vs_btc = alt_pct_change_24h - btc.pct_change_24h
 
         liquidity_sweep = self._detect_liquidity_sweep(candles_15m)
+        sr_zone = self._nearest_sr_zone(candles_1h)
 
         long_gate_ok = self._passes_hard_filters(
-            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep
+            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep, sr_zone
         )
         short_gate_ok = self._passes_hard_filters(
-            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep
+            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep, sr_zone
         )
 
         long_score, long_reasons = (
@@ -880,6 +900,7 @@ class ProfessionalSignalEngine:
         extension_pct: float,
         relative_strength_vs_btc: float,
         liquidity_sweep: str,
+        sr_zone: str,
     ) -> bool:
         """A direction must clear ALL of these before its weighted score even counts.
         This used to all be soft, additive scoring (lose some points here, make it up
@@ -945,6 +966,15 @@ class ProfessionalSignalEngine:
         if bullish and liquidity_sweep == "BearishSweep":
             return False
         if not bullish and liquidity_sweep == "BullishSweep":
+            return False
+        # Support/resistance: don't go LONG right into a level that's already
+        # rejected price multiple times (resistance), and don't go SHORT right into
+        # a level that's already held multiple times (support) — this is exactly
+        # backwards from how these zones tend to behave and was the core complaint:
+        # "resistance'tan long, support'tan short veriyor, tam tersi olmalı."
+        if bullish and sr_zone == "NearResistance":
+            return False
+        if not bullish and sr_zone == "NearSupport":
             return False
         return True
 
@@ -1199,6 +1229,43 @@ class ProfessionalSignalEngine:
         if swept_low and lower_wick > candle_range * 0.4:
             return "BullishSweep"
 
+        return "None"
+
+    @staticmethod
+    def _nearest_sr_zone(candles: list[Candle]) -> str:
+        """Support/resistance: is current price sitting right at a level that's been
+        tested (touched and reversed) multiple times recently — a double-top/double-
+        bottom style zone, exactly like the one circled on the reported chart. This
+        was completely missing: a pure trend-following read (EMAs, momentum) keeps
+        saying "bullish" right up until price hits a well-tested ceiling and rejects,
+        or "bearish" right up until it hits a well-tested floor and bounces — which is
+        backwards from how this level actually tends to behave. Returns
+        'NearResistance', 'NearSupport', or 'None'."""
+        if len(candles) < 60:
+            return "None"
+        lookback = candles[-120:] if len(candles) >= 120 else candles
+        current_price = lookback[-1].close
+        if current_price <= 0:
+            return "None"
+
+        window = 3
+        pivot_highs = []
+        pivot_lows = []
+        for i in range(window, len(lookback) - window):
+            segment = lookback[i - window : i + window + 1]
+            if lookback[i].high == max(c.high for c in segment):
+                pivot_highs.append(lookback[i].high)
+            if lookback[i].low == min(c.low for c in segment):
+                pivot_lows.append(lookback[i].low)
+
+        tolerance = current_price * 0.006  # ~0.6% band around the current price
+        resistance_touches = sum(1 for h in pivot_highs if abs(h - current_price) <= tolerance)
+        support_touches = sum(1 for l in pivot_lows if abs(l - current_price) <= tolerance)
+
+        if resistance_touches >= 2 and resistance_touches > support_touches:
+            return "NearResistance"
+        if support_touches >= 2 and support_touches > resistance_touches:
+            return "NearSupport"
         return "None"
 
     @staticmethod
@@ -1476,6 +1543,10 @@ class SignalBot:
             return
         signals = self.engine.scan()
         sent = 0
+        same_direction_counts = {
+            "LONG": self.db.same_direction_count("LONG", self.config.same_direction_window_minutes),
+            "SHORT": self.db.same_direction_count("SHORT", self.config.same_direction_window_minutes),
+        }
         for signal in signals[:5]:
             if self.db.has_open_position(signal.symbol):
                 continue
@@ -1485,8 +1556,11 @@ class SignalBot:
                 continue
             if self.db.signals_today_count(signal.symbol) >= self.config.max_signals_per_symbol_per_day:
                 continue
+            if same_direction_counts[signal.side] >= self.config.max_same_direction_signals:
+                continue
             self.telegram.send_message(format_signal_message(signal))
             self.db.save_signal(signal)
+            same_direction_counts[signal.side] += 1
             sent += 1
         if sent == 0 and send_empty_report:
             self.telegram.send_message(
