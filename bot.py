@@ -171,7 +171,17 @@ class MacroClient:
         """Returns 'Bullish', 'Bearish', 'Mixed', or 'Unknown'. Combines S&P 500
         (^GSPC) and NASDAQ Composite (^IXIC) — if only one of the two fetches
         succeeds, uses that one; if both fail, 'Unknown' (doesn't block either
-        trade direction, same as 'Mixed')."""
+        trade direction, same as 'Mixed').
+
+        On weekends the US market is closed — whatever this endpoint returns then is
+        just Friday's stale close-to-close comparison, not a live read, and can look
+        like a real "Bullish"/"Bearish" move when nothing actually happened. This is
+        exactly what let a run of Saturday SHORT signals lean on a stale reading.
+        Skip the fetch entirely on Sat/Sun and return 'Unknown' (neutral, doesn't
+        block either direction). Does not account for US market holidays."""
+        ny_time = datetime.now(ZoneInfo("America/New_York"))
+        if ny_time.weekday() >= 5:  # Saturday=5, Sunday=6 -> US market is closed
+            return "Unknown"
         spx_change = self._fetch_index_pct_change("%5EGSPC")
         nasdaq_change = self._fetch_index_pct_change("%5EIXIC")
         changes = [c for c in (spx_change, nasdaq_change) if c is not None]
@@ -648,6 +658,7 @@ class ProfessionalSignalEngine:
         self.macro = MacroClient(config.binance_timeout_seconds)
         self.last_scan_summary = "Henüz tarama yapılmadı."
         self.last_us_trend = "Unknown"
+        self.last_market_condition_summary = "Henüz tarama yapılmadı."
 
     def scan(self) -> list[Signal]:
         started = time.time()
@@ -668,6 +679,7 @@ class ProfessionalSignalEngine:
                 f"Son tarama: {local_now_text()}\n"
                 "Piyasa verisi çekilemedi (geçici ağ hatası), bu tarama atlandı — bir sonraki taramada tekrar denenecek."
             )
+            self.last_market_condition_summary = "Piyasa verisi şu an çekilemedi (geçici ağ hatası) — bir sonraki taramada tekrar denenecek."
             return []
         us_trend = self.macro.us_equities_trend()
         self.last_us_trend = us_trend
@@ -699,7 +711,49 @@ class ProfessionalSignalEngine:
             f"Sinyal adayı: {len(signals)}\n"
             f"Süre: {elapsed} sn"
         )
+        self.last_market_condition_summary = self._market_condition_summary(btc_health, us_trend, len(signals))
         return signals
+
+    @staticmethod
+    def _market_condition_summary(btc: BtcHealth, us_trend: str, signal_count: int) -> str:
+        """Plain-language read of current conditions, for the 'no new signal' report —
+        instead of a labeled stats dump (BTC: Healthy (Mixed, skor 82) etc.), say in
+        ordinary words what the market is doing and, when nothing fired, why."""
+        btc_direction_text = {
+            "Bullish": "BTC net yükseliş eğiliminde",
+            "Bearish": "BTC net düşüş eğiliminde",
+            "Mixed": "BTC şu anda net bir yön vermiyor, kararsız seyrediyor",
+        }.get(btc.direction, "BTC yönü belirsiz")
+
+        btc_status_text = {
+            "Healthy": "genel piyasa görünümü sağlıklı",
+            "Cautious": "piyasada temkinli olunması gereken bir hava var",
+            "Dangerous": "piyasa şu anda riskli görünüyor",
+        }.get(btc.status, "")
+
+        us_text = {
+            "Bullish": "ABD borsaları (S&P 500 + NASDAQ) yükselişte",
+            "Bearish": "ABD borsaları düşüşte",
+            "Mixed": "ABD borsaları kararsız seyrediyor",
+            "Unknown": "ABD borsası verisi şu an alınamadı",
+        }.get(us_trend, "")
+
+        summary = f"{btc_direction_text}, {btc_status_text}. {us_text}."
+
+        if signal_count == 0:
+            if btc.direction == "Mixed":
+                reason = (
+                    "BTC net bir yön vermediği için bu taramada hiçbir coin için LONG ya da "
+                    "SHORT aranmadı — piyasa netleşince tekrar değerlendirilecek."
+                )
+            else:
+                reason = (
+                    "Piyasanın yönü belliydi ama taranan coinlerin hiçbiri trend, destek/direnç, "
+                    "likidite avı gibi kalite filtrelerinin hepsini aynı anda geçemedi."
+                )
+            summary += f"\n\n{reason}"
+
+        return summary
 
     def _fast_filter_symbols(self) -> list[MarketSymbol]:
         tickers = self.binance.tickers_24h()
@@ -1565,8 +1619,8 @@ class SignalBot:
         if sent == 0 and send_empty_report:
             self.telegram.send_message(
                 "📊 Tarama tamamlandı, yeni sinyal yok.\n\n"
-                f"{self.engine.last_scan_summary}\n\n"
-                "Zayıf veya tekrarlı fırsatlar elendi."
+                f"{self.engine.last_market_condition_summary}\n\n"
+                "(Detaylı sayılar için /status)"
             )
 
     def status_text(self) -> str:
