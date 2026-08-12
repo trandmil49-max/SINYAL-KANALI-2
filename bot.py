@@ -1252,7 +1252,7 @@ class ProfessionalSignalEngine:
         return "Mixed"
 
     @staticmethod
-    def _detect_liquidity_sweep(candles: list[Candle]) -> str:
+    def _detect_liquidity_sweep(candles: list[Candle], recency_window: int = 3) -> str:
         """Classic 'liquidity sweep' / stop-hunt / fakeout (Smart Money Concepts /
         Wyckoff 'upthrust' and 'spring'): price pokes past a recent swing high or low
         — often triggering breakout buyers and resting stop orders — then FAILS to
@@ -1262,26 +1262,40 @@ class ProfessionalSignalEngine:
         that spike as bullish breakout confirmation instead of recognizing it as a
         fakeout top. Returns 'BearishSweep' (fake breakout up, favors NOT going long
         here), 'BullishSweep' (fake breakdown, favors NOT going short here), or
-        'None'."""
-        if len(candles) < 22:
-            return "None"
-        lookback = candles[-22:-2]  # recent swing range, excluding the most recent 2 candles
-        last = candles[-1]
-        prior_high = max(c.high for c in lookback)
-        prior_low = min(c.low for c in lookback)
-        candle_range = last.high - last.low
-        if candle_range <= 0:
-            return "None"
-        upper_wick = last.high - max(last.open, last.close)
-        lower_wick = min(last.open, last.close) - last.low
+        'None'.
 
-        swept_high = last.high > prior_high and last.close < prior_high
-        if swept_high and upper_wick > candle_range * 0.4:
-            return "BearishSweep"
+        RECENCY WINDOW FIX: this used to only check candles[-1] — literally just the
+        single most recent candle. Worse, klines() returns Binance's still-forming
+        candle as the last row, so that candle's wick can still change shape until it
+        actually closes. A sweep-and-reject doesn't stop mattering the instant that
+        one candle closes — the reported miss (LONG given when a sweep had just
+        rejected a high 1-2 candles earlier) is exactly what a single-candle-only
+        check misses. Now: the still-forming candle is excluded, and the last
+        `recency_window` CLOSED candles are each checked against the 20-candle range
+        before them — a sweep on any of them still counts."""
+        closed = candles[:-1]  # exclude the still-forming candle (last row from klines())
+        if len(closed) < 20 + recency_window:
+            return "None"
+        for i in range(len(closed) - recency_window, len(closed)):
+            lookback = closed[i - 20 : i]
+            candidate = closed[i]
+            if len(lookback) < 20:
+                continue
+            prior_high = max(c.high for c in lookback)
+            prior_low = min(c.low for c in lookback)
+            candle_range = candidate.high - candidate.low
+            if candle_range <= 0:
+                continue
+            upper_wick = candidate.high - max(candidate.open, candidate.close)
+            lower_wick = min(candidate.open, candidate.close) - candidate.low
 
-        swept_low = last.low < prior_low and last.close > prior_low
-        if swept_low and lower_wick > candle_range * 0.4:
-            return "BullishSweep"
+            swept_high = candidate.high > prior_high and candidate.close < prior_high
+            if swept_high and upper_wick > candle_range * 0.4:
+                return "BearishSweep"
+
+            swept_low = candidate.low < prior_low and candidate.close > prior_low
+            if swept_low and lower_wick > candle_range * 0.4:
+                return "BullishSweep"
 
         return "None"
 
