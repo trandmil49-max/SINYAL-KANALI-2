@@ -194,6 +194,46 @@ class MacroClient:
             return "Bearish"
         return "Mixed"
 
+    def dxy_trend(self) -> str:
+        """US Dollar Index (DXY) trend, read on the DAILY timeframe rather than
+        intraday noise — per report, DXY tends to move inversely to risk assets
+        (crypto, gold, US equities): DXY breaking below support has historically
+        coincided with those breaking up, and the reverse when DXY breaks above
+        resistance. Rather than hard-coding specific support/resistance price levels
+        (which go stale), this compares the latest daily close against its own 20-day
+        and 50-day averages — the same kind of trend-structure read _higher_timeframe_
+        trend already does with EMA50/EMA200, just applied to DXY. Returns 'Bearish'
+        (DXY falling — supportive for LONG on risk assets), 'Bullish' (DXY rising —
+        supportive for SHORT), 'Mixed', or 'Unknown' if the fetch fails. Same
+        defensive never-raises, never-blocks-a-trade design as us_equities_trend."""
+        try:
+            data = self.http.get_json(
+                "https://query1.finance.yahoo.com/v8/finance/chart/DX-Y.NYB",
+                params={"interval": "1d", "range": "3mo"},
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                    ),
+                    "Accept": "application/json",
+                },
+            )
+            closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            if len(closes) < 50:
+                return "Unknown"
+            price = closes[-1]
+            sma20 = statistics.fmean(closes[-20:])
+            sma50 = statistics.fmean(closes[-50:])
+            if price < sma20 < sma50:
+                return "Bearish"
+            if price > sma20 > sma50:
+                return "Bullish"
+            return "Mixed"
+        except Exception:
+            logging.exception("DXY fetch failed (non-fatal, ignored)")
+            return "Unknown"
+
 
 class TelegramClient:
     def __init__(self, token: str, chat_id: str, timeout_seconds: int) -> None:
@@ -631,24 +671,40 @@ class IndicatorEngine:
 
     @staticmethod
     def adx(candles: list[Candle], period: int = 14) -> float:
-        if len(candles) <= period + 1:
+        """ADX FIX: this used to compute a single DX (directional index) snapshot
+        from one period-length window and return that directly AS 'adx' — but real
+        ADX is specifically an AVERAGE of DX over `period`, which is what makes it
+        smooth/stable instead of swinging hard candle to candle. The thresholds used
+        elsewhere in this file (adx < 20 = not trending, 16-42 = acceptable range)
+        are standard ADX conventions, calibrated for that smoothed behavior — applying
+        them to a raw single-period DX reading is noisier than intended, and could
+        let a market gate open/closed on noise rather than sustained trend strength.
+        This now computes DX at each of the last `period` points and averages them."""
+        needed = period * 2 + 1
+        if len(candles) < needed:
             return 0.0
+        recent = candles[-needed:]
         plus_dm = []
         minus_dm = []
         true_ranges = []
-        recent = candles[-period - 1 :]
         for current, previous in zip(recent[1:], recent[:-1]):
             up_move = current.high - previous.high
             down_move = previous.low - current.low
             plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0)
             minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0)
             true_ranges.append(max(current.high - current.low, abs(current.high - previous.close), abs(current.low - previous.close)))
-        atr_value = sum(true_ranges) or 1
-        plus_di = 100 * sum(plus_dm) / atr_value
-        minus_di = 100 * sum(minus_dm) / atr_value
-        if plus_di + minus_di == 0:
+
+        dx_values = []
+        for i in range(period, len(plus_dm) + 1):
+            window_tr = sum(true_ranges[i - period : i]) or 1
+            plus_di = 100 * sum(plus_dm[i - period : i]) / window_tr
+            minus_di = 100 * sum(minus_dm[i - period : i]) / window_tr
+            di_sum = plus_di + minus_di
+            dx_values.append(100 * abs(plus_di - minus_di) / di_sum if di_sum else 0.0)
+
+        if not dx_values:
             return 0.0
-        return 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        return statistics.fmean(dx_values[-period:])
 
 
 class ProfessionalSignalEngine:
@@ -658,6 +714,7 @@ class ProfessionalSignalEngine:
         self.macro = MacroClient(config.binance_timeout_seconds)
         self.last_scan_summary = "Henüz tarama yapılmadı."
         self.last_us_trend = "Unknown"
+        self.last_dxy_trend = "Unknown"
         self.last_market_condition_summary = "Henüz tarama yapılmadı."
 
     def scan(self) -> list[Signal]:
@@ -683,14 +740,14 @@ class ProfessionalSignalEngine:
             return []
         us_trend = self.macro.us_equities_trend()
         self.last_us_trend = us_trend
+        dxy_trend = self.macro.dxy_trend()
+        self.last_dxy_trend = dxy_trend
         signals = []
         rejected = 0
 
         for market_symbol in candidates:
-            if market_symbol.symbol == "BTCUSDT":
-                continue
             try:
-                signal = self._analyze_symbol(market_symbol.symbol, btc_health, us_trend)
+                signal = self._analyze_symbol(market_symbol.symbol, btc_health, us_trend, dxy_trend)
             except Exception:
                 rejected += 1
                 logging.exception("Symbol analysis failed: %s", market_symbol.symbol)
@@ -706,6 +763,7 @@ class ProfessionalSignalEngine:
             f"Son tarama: {local_now_text()}\n"
             f"BTC: {btc_health.status} ({btc_health.direction}, skor {btc_health.score:.0f})\n"
             f"ABD Piyasası (S&P 500 + NASDAQ): {us_trend}\n"
+            f"Dolar Endeksi (DXY): {dxy_trend}\n"
             f"Analiz edilen: {len(candidates)}\n"
             f"Reddedilen: {rejected}\n"
             f"Sinyal adayı: {len(signals)}\n"
@@ -852,7 +910,7 @@ class ProfessionalSignalEngine:
             status = "Dangerous"
         return BtcHealth(status=status, direction=direction, score=score, volatility=volatility, details=details, pct_change_24h=pct_change_24h)
 
-    def _analyze_symbol(self, symbol: str, btc: BtcHealth, us_trend: str) -> Signal | None:
+    def _analyze_symbol(self, symbol: str, btc: BtcHealth, us_trend: str, dxy_trend: str) -> Signal | None:
         candles_15m = self.binance.klines(symbol, "15m", 210)
         candles_1h = self.binance.klines(symbol, "1h", 210)
         candles_4h = self.binance.klines(symbol, "4h", 210)
@@ -914,14 +972,16 @@ class ProfessionalSignalEngine:
         long_score, long_reasons = (
             self._score_direction(
                 "LONG", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
-                adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend,
+                adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend, dxy_trend,
+                liquidity_sweep, sr_zone,
             )
             if long_gate_ok else (0.0, [])
         )
         short_score, short_reasons = (
             self._score_direction(
                 "SHORT", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
-                adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend,
+                adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend, dxy_trend,
+                liquidity_sweep, sr_zone,
             )
             if short_gate_ok else (0.0, [])
         )
@@ -1053,6 +1113,9 @@ class ProfessionalSignalEngine:
         btc: BtcHealth,
         htf_trend: str,
         us_trend: str,
+        dxy_trend: str,
+        liquidity_sweep: str,
+        sr_zone: str,
     ) -> tuple[float, list[str]]:
         score = 0.0
         reasons = []
@@ -1103,6 +1166,42 @@ class ProfessionalSignalEngine:
         elif us_conflict:
             score -= 6
             reasons.append("US equities (S&P/NASDAQ) conflicting")
+
+        # Same soft-nudge treatment as us_trend above, but DXY moves OPPOSITE to risk
+        # assets: a falling dollar (Bearish DXY) supports LONG, a rising dollar
+        # (Bullish DXY) supports SHORT — so the mapping is inverted relative to us_ok.
+        dxy_ok = dxy_trend == ("Bearish" if bullish else "Bullish")
+        dxy_conflict = dxy_trend == ("Bullish" if bullish else "Bearish")
+        if dxy_ok:
+            score += 6
+            reasons.append("Dolar endeksi (DXY) destekleyici")
+        elif dxy_conflict:
+            score -= 6
+            reasons.append("Dolar endeksi (DXY) ters yönde")
+
+        # liquidity_sweep and sr_zone were ONLY ever used as hard blocks (in
+        # _passes_hard_filters) on the WRONG direction - a bearish sweep stopped LONG,
+        # but never actively helped SHORT qualify. That's exactly the reported gap:
+        # "temizliğini gördükten sonra short vermem gerekiyor" (after seeing the
+        # sweep/cleanup, I need a SHORT) - a sweep should be a reason FOR the reversal
+        # trade, not just a veto on the wrong one. Same idea for a tested support/
+        # resistance touch: bouncing off a well-tested support is itself a reason to
+        # go LONG from there specifically, not just "not blocked in the middle of a
+        # range." Both get a real weight here since they're the most specific,
+        # chart-level confirmation available - similar in spirit to trend/structure.
+        if bullish and liquidity_sweep == "BullishSweep":
+            score += 10
+            reasons.append("Likidite avı (sweep) bu yönü destekliyor")
+        if not bullish and liquidity_sweep == "BearishSweep":
+            score += 10
+            reasons.append("Likidite avı (sweep) bu yönü destekliyor")
+
+        if bullish and sr_zone == "NearSupport":
+            score += 8
+            reasons.append("Test edilmiş destek bölgesinden dönüş")
+        if not bullish and sr_zone == "NearResistance":
+            score += 8
+            reasons.append("Test edilmiş direnç bölgesinden dönüş")
 
         if rel_volume >= 1.15:
             score += 12
@@ -1181,11 +1280,17 @@ class ProfessionalSignalEngine:
     # rather than send a trade whose worst case is still a huge loss.
     MAX_STOP_DISTANCE_PCT = 0.08
 
-    # SHORT must clear a HIGHER confidence bar than LONG — crypto's structural upward
-    # bias means a short needs to be a noticeably stronger setup to justify the same
-    # risk. Added after a day where 14/14 SHORT signals hit their stop while LONG-only
-    # signals the next day performed meaningfully better.
-    SHORT_EXTRA_CONFIRMATION = 6
+    # REMOVED (was 6): this used to force SHORT to clear a higher confidence bar than
+    # LONG, on the theory that crypto's structural upward bias makes shorts riskier.
+    # That was added after a day where 14/14 SHORT signals hit stop — but the BTC
+    # 'Mixed' fix above (now blocking BOTH directions when BTC is ambiguous, not just
+    # SHORT) targets that same root cause more precisely, and predates this constant.
+    # Left in place, this handicap was producing a severe imbalance (39 LONG vs 5
+    # SHORT in one week) while LONG itself was not winning either (14% win rate that
+    # same week, 25 SL vs 4 TP2) — so it wasn't protecting the account, just
+    # concentrating losses into LONG instead of screening trades on their own merit.
+    # Both directions now clear the same confidence bar.
+    SHORT_EXTRA_CONFIRMATION = 0
 
     def _build_signal(
         self, symbol: str, side: str, confidence: float, entry: float, atr: float, atr_1h: float,
@@ -1202,7 +1307,12 @@ class ProfessionalSignalEngine:
         stop_distance_pct = risk_distance / entry
         if stop_distance_pct > self.MAX_STOP_DISTANCE_PCT:
             return None  # too volatile to risk-manage — e.g. this is what let a -36% leveraged loss through on 1000XECUSDT
-        reward_1 = risk_distance * 1.45
+        # TP1 used to sit at 1.45x the risk distance. Restated preference: TP1 alone
+        # (not TP2) is what counts as "this trade worked" — TP2 is a bonus if price
+        # keeps going, not the target being optimized for. A closer TP1 is reached far
+        # more often for the same entry quality, at the cost of a smaller win when it
+        # does. TP2 is unchanged — still the "let it run" target for the rest.
+        reward_1 = risk_distance * 1.0
         reward_2 = risk_distance * 2.25
         if side == "LONG":
             stop_loss = entry - risk_distance
@@ -1592,11 +1702,16 @@ class SignalBot:
         that against), so instead of guessing at an untested integration, this avoids
         opening NEW positions in a caution window around that known, fixed time.
         Existing open positions are unaffected — TP/SL monitoring keeps running as normal.
+
+        WINDOW WIDENED: was 9:15-10:30 AM ET. Reported pattern: a fake pump roughly
+        30-60 minutes BEFORE the open (so as early as ~8:30 AM ET) that the bot read
+        as bullish and longed, which then reversed — the old window started too late
+        (15 min before open) to cover that. Now starts at 8:30 AM ET.
         Does not account for US market holidays."""
         ny_time = now_local.astimezone(cls.US_MARKET_OPEN_TZ)
         if ny_time.weekday() >= 5:  # Saturday/Sunday -> US market isn't open anyway
             return False
-        window_start = ny_time.replace(hour=9, minute=15, second=0, microsecond=0)
+        window_start = ny_time.replace(hour=8, minute=30, second=0, microsecond=0)
         window_end = ny_time.replace(hour=10, minute=30, second=0, microsecond=0)
         return window_start <= ny_time <= window_end
 
@@ -1731,15 +1846,36 @@ def format_breakeven_hit_message(row: sqlite3.Row, price: float) -> str:
 
 
 def format_reasons(reasons: Iterable[str]) -> str:
+    # This used to whitelist only 4 reason strings (Trend/Momentum/Structure/4H) -
+    # every other signal the bot actually checks (BTC status, US equities, DXY,
+    # liquidity sweep, support/resistance zone, funding, long/short ratio) was
+    # silently dropped here and never reached the Telegram message, even though
+    # _score_direction was already computing all of it. Expanded to show everything
+    # that's a genuine positive confirmation; still excludes negative/conflict
+    # reasons (those already reduced the score - showing them under a "Confirmed"
+    # checklist would be misleading) and "Open interest available" (that's data
+    # availability, not a directional confirmation).
     allowed = {
         "Trend confirmed": "✅ Trend Confirmed",
         "Momentum confirmed": "✅ Momentum Confirmed",
         "Market structure confirmed": "✅ Structure Confirmed",
         "Higher timeframe (4h) trend aligned": "✅ 4H Trend Confirmed",
+        "US equities (S&P/NASDAQ) aligned": "✅ US Equities Confirmed",
+        "Dolar endeksi (DXY) destekleyici": "✅ DXY Confirmed",
+        "Likidite avı (sweep) bu yönü destekliyor": "✅ Liquidity Sweep Confirmed",
+        "Test edilmiş destek bölgesinden dönüş": "✅ Support Zone Confirmed",
+        "Test edilmiş direnç bölgesinden dönüş": "✅ Resistance Zone Confirmed",
+        "Trend strength acceptable": "✅ Trend Strength Confirmed",
+        "Volatility controlled": "✅ Volatility Confirmed",
+        "Funding acceptable": "✅ Funding Confirmed",
+        "Long/short oranı LONG lehine destekleyici": "✅ Long/Short Ratio Confirmed",
+        "Long/short oranı SHORT lehine destekleyici": "✅ Long/Short Ratio Confirmed",
     }
     lines = [allowed[reason] for reason in reasons if reason in allowed]
     if any(reason.startswith("Volume confirmed") for reason in reasons):
         lines.append("✅ Volume Confirmed")
+    if any(reason.startswith("BTC status supportive") for reason in reasons):
+        lines.append("✅ BTC Confirmed")
     if not lines:
         lines.append("✅ Multi-layer validation passed")
     return "\n".join(lines)
