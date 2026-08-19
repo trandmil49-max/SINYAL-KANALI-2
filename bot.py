@@ -167,32 +167,75 @@ class MacroClient:
             logging.exception("%s fetch failed (non-fatal, ignored)", yahoo_ticker)
             return None
 
-    def us_equities_trend(self) -> str:
-        """Returns 'Bullish', 'Bearish', 'Mixed', or 'Unknown'. Combines S&P 500
-        (^GSPC) and NASDAQ Composite (^IXIC) — if only one of the two fetches
-        succeeds, uses that one; if both fail, 'Unknown' (doesn't block either
-        trade direction, same as 'Mixed').
+    @staticmethod
+    def _classify_pct_change(change: float | None) -> str:
+        if change is None:
+            return "Unknown"
+        if change > 0.003:
+            return "Bullish"
+        if change < -0.003:
+            return "Bearish"
+        return "Mixed"
 
-        On weekends the US market is closed — whatever this endpoint returns then is
-        just Friday's stale close-to-close comparison, not a live read, and can look
-        like a real "Bullish"/"Bearish" move when nothing actually happened. This is
-        exactly what let a run of Saturday SHORT signals lean on a stale reading.
-        Skip the fetch entirely on Sat/Sun and return 'Unknown' (neutral, doesn't
-        block either direction). Does not account for US market holidays."""
+    def us_equities_detail(self) -> dict[str, str]:
+        """Fetches S&P 500 (^GSPC) and NASDAQ Composite (^IXIC) ONCE and returns
+        each one's own trend plus the combined verdict, as
+        {'spx': ..., 'nasdaq': ..., 'combined': ...} - each value is 'Bullish',
+        'Bearish', 'Mixed', or 'Unknown'. Added because the report asked to SEE
+        S&P 500 and NASDAQ separately in the status message, not just the merged
+        read that us_equities_trend() already used for scoring - this does one
+        fetch and serves both needs instead of fetching twice per scan.
+
+        Same weekend-staleness guard as before: skip the fetch entirely on Sat/Sun
+        (US market closed) and return 'Unknown' for all three."""
         ny_time = datetime.now(ZoneInfo("America/New_York"))
         if ny_time.weekday() >= 5:  # Saturday=5, Sunday=6 -> US market is closed
-            return "Unknown"
+            return {"spx": "Unknown", "nasdaq": "Unknown", "combined": "Unknown"}
         spx_change = self._fetch_index_pct_change("%5EGSPC")
         nasdaq_change = self._fetch_index_pct_change("%5EIXIC")
         changes = [c for c in (spx_change, nasdaq_change) if c is not None]
-        if not changes:
-            return "Unknown"
-        avg_change = sum(changes) / len(changes)
-        if avg_change > 0.003:
-            return "Bullish"
-        if avg_change < -0.003:
-            return "Bearish"
-        return "Mixed"
+        combined = self._classify_pct_change(sum(changes) / len(changes)) if changes else "Unknown"
+        return {
+            "spx": self._classify_pct_change(spx_change),
+            "nasdaq": self._classify_pct_change(nasdaq_change),
+            "combined": combined,
+        }
+
+    def us_equities_trend(self) -> str:
+        """Returns just the combined verdict from us_equities_detail() - kept as its
+        own method since this is what the scoring code calls and it reads clearer
+        at each call site than us_equities_detail()['combined']."""
+        return self.us_equities_detail()["combined"]
+
+    def crypto_dominance(self) -> dict[str, float] | None:
+        """BTC and USDT dominance (each coin's share of total crypto market cap, as
+        a percentage) via CoinGecko's free public /global endpoint (no key
+        required). Requested explicitly: 'BTC dominansı, USDT dominansı' as two of
+        the four things the status message should show.
+
+        Returns {'btc': pct, 'usdt': pct} (e.g. {'btc': 52.3, 'usdt': 4.1}), or None
+        if the fetch/parse fails for any reason - never raises. This endpoint gives
+        a current SNAPSHOT only, no historical series, so rising/falling is judged
+        by comparing consecutive scans against each other (see
+        last_btc_dominance_pct / last_usdt_dominance_pct on the engine), the same
+        way any other scan-over-scan trend read in this file works - not by this
+        method itself.
+
+        Same untestable-from-this-sandbox caveat as the rest of MacroClient: this
+        talks to a real third-party API that this development environment has no
+        network access to reach, so this specific integration could not be
+        exercised end-to-end before shipping. Check /status after deploying."""
+        try:
+            data = self.http.get_json("https://api.coingecko.com/api/v3/global")
+            pct = data["data"]["market_cap_percentage"]
+            btc = pct.get("btc")
+            usdt = pct.get("usdt")
+            if btc is None or usdt is None:
+                return None
+            return {"btc": float(btc), "usdt": float(usdt)}
+        except Exception:
+            logging.exception("CoinGecko dominance fetch failed (non-fatal, ignored)")
+            return None
 
     def dxy_trend(self) -> str:
         """US Dollar Index (DXY) trend, read on the DAILY timeframe rather than
@@ -714,8 +757,31 @@ class ProfessionalSignalEngine:
         self.macro = MacroClient(config.binance_timeout_seconds)
         self.last_scan_summary = "Henüz tarama yapılmadı."
         self.last_us_trend = "Unknown"
+        self.last_spx_trend = "Unknown"
+        self.last_nasdaq_trend = "Unknown"
         self.last_dxy_trend = "Unknown"
+        self.last_btc_dominance_trend = "Unknown"
+        self.last_usdt_dominance_trend = "Unknown"
+        self.last_btc_dominance_pct: float | None = None
+        self.last_usdt_dominance_pct: float | None = None
         self.last_market_condition_summary = "Henüz tarama yapılmadı."
+
+    @staticmethod
+    def _dominance_trend(previous: float | None, current: float | None, dead_zone: float = 0.10) -> str:
+        """CoinGecko's free /global endpoint is a snapshot, not a historical series,
+        so unlike DXY/SPX (daily SMA20 vs SMA50) there's no way to compute a real
+        trend from a single call. Instead this compares the current scan's reading
+        against the PREVIOUS scan's (stored on the engine) - a dead_zone of 0.10
+        percentage points avoids flip-flopping on noise between two back-to-back
+        scans. Returns 'Unknown' until there are at least two readings to compare."""
+        if previous is None or current is None:
+            return "Unknown"
+        delta = current - previous
+        if delta > dead_zone:
+            return "Rising"
+        if delta < -dead_zone:
+            return "Falling"
+        return "Flat"
 
     def scan(self) -> list[Signal]:
         started = time.time()
@@ -738,16 +804,32 @@ class ProfessionalSignalEngine:
             )
             self.last_market_condition_summary = "Piyasa verisi şu an çekilemedi (geçici ağ hatası) — bir sonraki taramada tekrar denenecek."
             return []
-        us_trend = self.macro.us_equities_trend()
+        us_detail = self.macro.us_equities_detail()
+        us_trend = us_detail["combined"]
         self.last_us_trend = us_trend
+        self.last_spx_trend = us_detail["spx"]
+        self.last_nasdaq_trend = us_detail["nasdaq"]
         dxy_trend = self.macro.dxy_trend()
         self.last_dxy_trend = dxy_trend
+
+        dominance = self.macro.crypto_dominance()
+        btc_dom_pct = dominance["btc"] if dominance else None
+        usdt_dom_pct = dominance["usdt"] if dominance else None
+        btc_dom_trend = self._dominance_trend(self.last_btc_dominance_pct, btc_dom_pct)
+        usdt_dom_trend = self._dominance_trend(self.last_usdt_dominance_pct, usdt_dom_pct)
+        self.last_btc_dominance_trend = btc_dom_trend
+        self.last_usdt_dominance_trend = usdt_dom_trend
+        self.last_btc_dominance_pct = btc_dom_pct if btc_dom_pct is not None else self.last_btc_dominance_pct
+        self.last_usdt_dominance_pct = usdt_dom_pct if usdt_dom_pct is not None else self.last_usdt_dominance_pct
+
         signals = []
         rejected = 0
 
         for market_symbol in candidates:
             try:
-                signal = self._analyze_symbol(market_symbol.symbol, btc_health, us_trend, dxy_trend)
+                signal = self._analyze_symbol(
+                    market_symbol.symbol, btc_health, us_trend, dxy_trend, btc_dom_trend, usdt_dom_trend,
+                )
             except Exception:
                 rejected += 1
                 logging.exception("Symbol analysis failed: %s", market_symbol.symbol)
@@ -759,11 +841,40 @@ class ProfessionalSignalEngine:
 
         signals.sort(key=lambda item: item.confidence, reverse=True)
         elapsed = round(time.time() - started, 1)
+
+        # Requested explicitly: "bunlar hangileri destekliyor? Piyasayı?" (which of
+        # these support the market?) - SPX/NASDAQ Bullish, DXY Bearish (falling dollar
+        # helps risk assets), and falling USDT dominance (money leaving stablecoins
+        # into risk assets) all read as market-supportive; only known (non-Unknown)
+        # readings are counted. BTC dominance is left out of this specific count since
+        # it means something different for BTC itself vs for altcoins (falling BTC.D
+        # is an "alt season" signal, not necessarily bullish for BTC's own price) -
+        # it's still shown on its own line just below.
+        supportive_checks = [
+            ("S&P 500", us_detail["spx"] == "Bullish", us_detail["spx"] != "Unknown"),
+            ("NASDAQ", us_detail["nasdaq"] == "Bullish", us_detail["nasdaq"] != "Unknown"),
+            ("DXY", dxy_trend == "Bearish", dxy_trend != "Unknown"),
+            ("USDT Dominansı", usdt_dom_trend == "Falling", usdt_dom_trend != "Unknown"),
+        ]
+        known = [(name, ok) for name, ok, is_known in supportive_checks if is_known]
+        supportive_names = [name for name, ok in known if ok]
+        supportive_line = (
+            f"{', '.join(supportive_names) if supportive_names else 'Hiçbiri'} ({len(supportive_names)}/{len(known)} bilinen)"
+            if known else "Bilinmiyor (veri çekilemedi)"
+        )
+
+        btc_dom_text = f"{btc_dom_trend}" + (f" ({btc_dom_pct:.1f}%)" if btc_dom_pct is not None else "")
+        usdt_dom_text = f"{usdt_dom_trend}" + (f" ({usdt_dom_pct:.1f}%)" if usdt_dom_pct is not None else "")
+
         self.last_scan_summary = (
             f"Son tarama: {local_now_text()}\n"
             f"BTC: {btc_health.status} ({btc_health.direction}, skor {btc_health.score:.0f})\n"
-            f"ABD Piyasası (S&P 500 + NASDAQ): {us_trend}\n"
+            f"S&P 500: {us_detail['spx']}\n"
+            f"NASDAQ: {us_detail['nasdaq']}\n"
             f"Dolar Endeksi (DXY): {dxy_trend}\n"
+            f"BTC Dominansı: {btc_dom_text}\n"
+            f"USDT Dominansı: {usdt_dom_text}\n"
+            f"Piyasayı destekleyen: {supportive_line}\n"
             f"Analiz edilen: {len(candidates)}\n"
             f"Reddedilen: {rejected}\n"
             f"Sinyal adayı: {len(signals)}\n"
@@ -910,10 +1021,17 @@ class ProfessionalSignalEngine:
             status = "Dangerous"
         return BtcHealth(status=status, direction=direction, score=score, volatility=volatility, details=details, pct_change_24h=pct_change_24h)
 
-    def _analyze_symbol(self, symbol: str, btc: BtcHealth, us_trend: str, dxy_trend: str) -> Signal | None:
+    def _analyze_symbol(
+        self, symbol: str, btc: BtcHealth, us_trend: str, dxy_trend: str, btc_dom_trend: str, usdt_dom_trend: str,
+    ) -> Signal | None:
         candles_15m = self.binance.klines(symbol, "15m", 210)
         candles_1h = self.binance.klines(symbol, "1h", 210)
         candles_4h = self.binance.klines(symbol, "4h", 210)
+        # Long-term liquidity zones: an old high/low from months (up to ~a year) back
+        # that price never came back to since - "iki ay önceki fitilde bir likidasyon
+        # var, oraya inip temizleyebilir." Fetched separately, daily candles, since
+        # nothing else here looks back further than ~9 days (candles_1h at 210x1h).
+        candles_1d = self.binance.klines(symbol, "1d", 400)
         if len(candles_15m) < 100 or len(candles_1h) < 100:
             return None
 
@@ -960,20 +1078,29 @@ class ProfessionalSignalEngine:
         relative_strength_vs_btc = alt_pct_change_24h - btc.pct_change_24h
 
         liquidity_sweep = self._detect_liquidity_sweep(candles_15m)
+        structural_bias = self._structural_sweep_bias(candles_15m)
         sr_zone = self._nearest_sr_zone(candles_1h)
+        long_term_zone = self._long_term_liquidity_zone(candles_1d)
 
         long_gate_ok = self._passes_hard_filters(
-            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep, sr_zone
+            True, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep, sr_zone, structural_bias, long_term_zone
         )
         short_gate_ok = self._passes_hard_filters(
-            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep, sr_zone
+            False, price, ema20[-1], ema50[-1], ema200_1h[-1], adx, structure, htf_trend, btc, extension_pct, relative_strength_vs_btc, liquidity_sweep, sr_zone, structural_bias, long_term_zone
         )
+
+        # BTC dominance (rising = capital rotating INTO BTC, typically OUT of alts) is
+        # only meaningful for ALTCOIN trades - it says nothing clean about BTC's own
+        # USD price direction (BTC.D can rise while BTC itself is flat or even
+        # falling, just falling less than everything else). Pass "Unknown" (neutral,
+        # no score effect) when the symbol being analyzed IS BTC itself.
+        effective_btc_dom_trend = "Unknown" if symbol == "BTCUSDT" else btc_dom_trend
 
         long_score, long_reasons = (
             self._score_direction(
                 "LONG", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
                 adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend, dxy_trend,
-                liquidity_sweep, sr_zone,
+                liquidity_sweep, sr_zone, effective_btc_dom_trend, usdt_dom_trend, structural_bias, long_term_zone,
             )
             if long_gate_ok else (0.0, [])
         )
@@ -981,7 +1108,7 @@ class ProfessionalSignalEngine:
             self._score_direction(
                 "SHORT", price, ema20[-1], ema50[-1], ema200_1h[-1], rsi, macd_line, macd_signal, macd_hist,
                 adx, rel_volume, funding, open_interest, long_short_ratio, structure, volatility, btc, htf_trend, us_trend, dxy_trend,
-                liquidity_sweep, sr_zone,
+                liquidity_sweep, sr_zone, effective_btc_dom_trend, usdt_dom_trend, structural_bias, long_term_zone,
             )
             if short_gate_ok else (0.0, [])
         )
@@ -1015,6 +1142,8 @@ class ProfessionalSignalEngine:
         relative_strength_vs_btc: float,
         liquidity_sweep: str,
         sr_zone: str,
+        structural_bias: str,
+        long_term_zone: str,
     ) -> bool:
         """A direction must clear ALL of these before its weighted score even counts.
         This used to all be soft, additive scoring (lose some points here, make it up
@@ -1081,6 +1210,16 @@ class ProfessionalSignalEngine:
             return False
         if not bullish and liquidity_sweep == "BullishSweep":
             return False
+        # Same idea as the point-in-time sweep above, but for a sweep that happened
+        # further back and is STILL being respected (price never traded back through
+        # it since) - reported gap: a sweep low followed by a multi-hour rally, where
+        # later SHORT signals fired 1-3 hours after the sweep candle itself, too late
+        # for the narrow 3-candle window above but still very much the same "don't
+        # fight this reversal" situation.
+        if bullish and structural_bias == "BearishBias":
+            return False
+        if not bullish and structural_bias == "BullishBias":
+            return False
         # Support/resistance: don't go LONG right into a level that's already
         # rejected price multiple times (resistance), and don't go SHORT right into
         # a level that's already held multiple times (support) — this is exactly
@@ -1089,6 +1228,14 @@ class ProfessionalSignalEngine:
         if bullish and sr_zone == "NearResistance":
             return False
         if not bullish and sr_zone == "NearSupport":
+            return False
+        # Same idea, but for an OLD (up to ~a year back) unswept high/low - "iki ay
+        # önceki fitilde bir likidasyon var, oraya inip temizleyebilir." Don't go
+        # LONG right into an old unswept high, don't go SHORT right into an old
+        # unswept low - same backwards-zone logic as the recent SR check above.
+        if bullish and long_term_zone == "NearOldResistance":
+            return False
+        if not bullish and long_term_zone == "NearOldSupport":
             return False
         return True
 
@@ -1116,6 +1263,10 @@ class ProfessionalSignalEngine:
         dxy_trend: str,
         liquidity_sweep: str,
         sr_zone: str,
+        btc_dom_trend: str,
+        usdt_dom_trend: str,
+        structural_bias: str,
+        long_term_zone: str,
     ) -> tuple[float, list[str]]:
         score = 0.0
         reasons = []
@@ -1196,12 +1347,53 @@ class ProfessionalSignalEngine:
             score += 10
             reasons.append("Likidite avı (sweep) bu yönü destekliyor")
 
+        # Same as the point-in-time sweep just above, but for a still-holding sweep
+        # from further back (see _structural_sweep_bias) - a rally that's been
+        # respecting a sweep low for hours is exactly as valid a reason to favor LONG
+        # as a sweep that just happened on the last candle.
+        if bullish and structural_bias == "BullishBias":
+            score += 10
+            reasons.append("Sürmekte olan likidite avı yapısı bu yönü destekliyor")
+        if not bullish and structural_bias == "BearishBias":
+            score += 10
+            reasons.append("Sürmekte olan likidite avı yapısı bu yönü destekliyor")
+
         if bullish and sr_zone == "NearSupport":
             score += 8
             reasons.append("Test edilmiş destek bölgesinden dönüş")
         if not bullish and sr_zone == "NearResistance":
             score += 8
             reasons.append("Test edilmiş direnç bölgesinden dönüş")
+
+        # Old (up to ~a year back), never-revisited high/low - same weight as the
+        # recent SR zone above, since an untouched old level can pull just as hard.
+        if bullish and long_term_zone == "NearOldSupport":
+            score += 8
+            reasons.append("Eski (uzun vadeli) likidite bölgesinden dönüş")
+        if not bullish and long_term_zone == "NearOldResistance":
+            score += 8
+            reasons.append("Eski (uzun vadeli) likidite bölgesinden dönüş")
+
+        # BTC dominance: RISING means capital rotating INTO BTC and OUT of altcoins -
+        # bearish for an altcoin LONG, supportive of an altcoin SHORT. Already passed
+        # as "Unknown" (no effect) when the symbol being analyzed IS BTC itself, since
+        # this reads rotation between BTC and alts, not BTC's own direction.
+        if bullish and btc_dom_trend == "Falling":
+            score += 5
+            reasons.append("BTC dominansı düşüyor (alt rotasyonu destekleyici)")
+        elif not bullish and btc_dom_trend == "Rising":
+            score += 5
+            reasons.append("BTC dominansı yükseliyor (alt rotasyonu ters yönde)")
+
+        # USDT dominance: RISING means capital moving INTO stablecoins - broad
+        # risk-off, bearish for crypto generally (any symbol, BTC included).
+        # FALLING means capital moving OUT of stablecoins into risk assets.
+        if bullish and usdt_dom_trend == "Falling":
+            score += 5
+            reasons.append("USDT dominansı düşüyor (risk iştahı destekleyici)")
+        elif not bullish and usdt_dom_trend == "Rising":
+            score += 5
+            reasons.append("USDT dominansı yükseliyor (risk iştahı azalıyor)")
 
         if rel_volume >= 1.15:
             score += 12
@@ -1410,6 +1602,51 @@ class ProfessionalSignalEngine:
         return "None"
 
     @staticmethod
+    def _structural_sweep_bias(candles: list[Candle], lookback: int = 60) -> str:
+        """_detect_liquidity_sweep only looks at the last `recency_window` (3)
+        candles - it correctly catches a FRESH sweep, but its protective effect
+        expires 45 minutes later even if the market is still clearly respecting
+        that reversal. This is exactly the reported gap: a sweep low followed by a
+        multi-HOUR rally, where later altcoin SHORT signals fired 1-3 hours after
+        the sweep candle itself - too late for the narrow window to still see it,
+        even though price never came close to revisiting that low the whole time.
+
+        Scans back through `lookback` candles (60 x 15m = 15h) for the MOST RECENT
+        candle that qualifies as a sweep (same wick/rejection test as
+        _detect_liquidity_sweep), then checks whether every candle SINCE has
+        respected it (never closed back through the swept level). If yes, that
+        sweep's bias is still structurally active - the reversal hasn't been
+        invalidated, no matter how many candles ago it happened. Returns
+        'BullishBias' (a bullish sweep low is still holding - don't fight it with a
+        SHORT), 'BearishBias' (mirror case for a resistance sweep), or 'None' (no
+        sweep found in range, or the most recent one already got invalidated by
+        price trading back through it)."""
+        closed = candles[:-1]
+        if len(closed) < lookback + 20:
+            return "None"
+        window = closed[-lookback:]
+        for i in range(len(window) - 1, 19, -1):  # scan backward: most recent first
+            lookback_slice = window[i - 20 : i]
+            candidate = window[i]
+            prior_high = max(c.high for c in lookback_slice)
+            prior_low = min(c.low for c in lookback_slice)
+            candle_range = candidate.high - candidate.low
+            if candle_range <= 0:
+                continue
+            upper_wick = candidate.high - max(candidate.open, candidate.close)
+            lower_wick = min(candidate.open, candidate.close) - candidate.low
+
+            if candidate.low < prior_low and candidate.close > prior_low and lower_wick > candle_range * 0.4:
+                still_holding = all(c.close > candidate.low for c in window[i + 1 :])
+                return "BullishBias" if still_holding else "None"
+
+            if candidate.high > prior_high and candidate.close < prior_high and upper_wick > candle_range * 0.4:
+                still_holding = all(c.close < candidate.high for c in window[i + 1 :])
+                return "BearishBias" if still_holding else "None"
+
+        return "None"
+
+    @staticmethod
     def _nearest_sr_zone(candles: list[Candle]) -> str:
         """Support/resistance: is current price sitting right at a level that's been
         tested (touched and reversed) multiple times recently — a double-top/double-
@@ -1444,6 +1681,50 @@ class ProfessionalSignalEngine:
             return "NearResistance"
         if support_touches >= 2 and support_touches > resistance_touches:
             return "NearSupport"
+        return "None"
+
+    @staticmethod
+    def _long_term_liquidity_zone(candles_1d: list[Candle]) -> str:
+        """Different concept from _nearest_sr_zone (which wants a level TESTED 2+
+        times within the last ~9 days). This is the reported idea: an old,
+        significant high or low from months back (up to ~a year, using DAILY
+        candles) that price swept ONCE and never came back to since - resting
+        liquidity/stops from that move are still untouched, and price often gets
+        drawn back to it eventually. Only needs ONE occurrence, not repeated
+        touches - the fact that it was never revisited since is what still makes it
+        'live'. Deliberately skips the most recent 14 days (that range is already
+        covered by _nearest_sr_zone and the sweep detectors above) so this is
+        specifically about the OLDER, longer-forgotten levels.
+        Returns 'NearOldResistance', 'NearOldSupport', or 'None'."""
+        closed = candles_1d[:-1]
+        if len(closed) < 30:
+            return "None"
+        current_price = candles_1d[-1].close  # latest candle (may still be forming) - reflects price NOW
+        if current_price <= 0:
+            return "None"
+
+        window = 5
+        cutoff = max(window, len(closed) - 14)
+        old_highs = []
+        old_lows = []
+        for i in range(window, cutoff - window):
+            segment = closed[i - window : i + window + 1]
+            candidate = closed[i]
+            if candidate.high == max(c.high for c in segment):
+                if all(c.high < candidate.high for c in closed[i + 1 :]):
+                    old_highs.append(candidate.high)
+            if candidate.low == min(c.low for c in segment):
+                if all(c.low > candidate.low for c in closed[i + 1 :]):
+                    old_lows.append(candidate.low)
+
+        tolerance = current_price * 0.02  # 2% - daily-candle levels are coarser than the hourly SR check
+        near_resistance = any(abs(h - current_price) <= tolerance for h in old_highs)
+        near_support = any(abs(l - current_price) <= tolerance for l in old_lows)
+
+        if near_resistance and not near_support:
+            return "NearOldResistance"
+        if near_support and not near_resistance:
+            return "NearOldSupport"
         return "None"
 
     @staticmethod
@@ -1863,8 +2144,14 @@ def format_reasons(reasons: Iterable[str]) -> str:
         "US equities (S&P/NASDAQ) aligned": "✅ US Equities Confirmed",
         "Dolar endeksi (DXY) destekleyici": "✅ DXY Confirmed",
         "Likidite avı (sweep) bu yönü destekliyor": "✅ Liquidity Sweep Confirmed",
+        "Sürmekte olan likidite avı yapısı bu yönü destekliyor": "✅ Liquidity Sweep Confirmed",
         "Test edilmiş destek bölgesinden dönüş": "✅ Support Zone Confirmed",
         "Test edilmiş direnç bölgesinden dönüş": "✅ Resistance Zone Confirmed",
+        "Eski (uzun vadeli) likidite bölgesinden dönüş": "✅ Long-Term Liquidity Zone Confirmed",
+        "BTC dominansı düşüyor (alt rotasyonu destekleyici)": "✅ BTC Dominance Confirmed",
+        "BTC dominansı yükseliyor (alt rotasyonu ters yönde)": "✅ BTC Dominance Confirmed",
+        "USDT dominansı düşüyor (risk iştahı destekleyici)": "✅ USDT Dominance Confirmed",
+        "USDT dominansı yükseliyor (risk iştahı azalıyor)": "✅ USDT Dominance Confirmed",
         "Trend strength acceptable": "✅ Trend Strength Confirmed",
         "Volatility controlled": "✅ Volatility Confirmed",
         "Funding acceptable": "✅ Funding Confirmed",
